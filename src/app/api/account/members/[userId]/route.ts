@@ -1,41 +1,30 @@
 // ============================================================
 // /api/account/members/[userId]
-//
-//   PATCH  — change a member's role.   Admin+.
-//   DELETE — remove a member.          Admin+.
-//
-// Both delegate to SECURITY DEFINER RPCs from migration 018:
-//   - set_member_role(p_user_id, p_new_role)
-//   - remove_account_member(p_user_id)
-//
-// The RPCs do the *real* authorisation work — caller must be
-// admin+, target must be in caller's account, target can't be the
-// owner, can't be self. The TS layer here only forwards the call
-// and maps Postgres SQLSTATEs back to HTTP statuses.
 // ============================================================
 
 import { NextResponse } from "next/server";
-import type { PostgrestError } from "@supabase/supabase-js";
 
 import { requireRole, toErrorResponse } from "@/lib/auth/account";
+import {
+  removeAccountMember,
+  setMemberRole,
+} from "@/lib/auth/members";
 import { isAccountRole } from "@/lib/auth/roles";
+import { SqlStateError } from "@/lib/db/sql-state-error";
 import {
   checkRateLimit,
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
 
-// Map known SQLSTATEs from the RPCs (see migration 018) onto HTTP
-// statuses. The `error.code` field is the SQLSTATE; the `message`
-// is the human-readable RAISE message we put in the migration.
-function rpcErrorToResponse(err: PostgrestError): NextResponse {
+function rpcErrorToResponse(err: SqlStateError): NextResponse {
   if (err.code === "42501") {
     return NextResponse.json({ error: err.message }, { status: 403 });
   }
   if (err.code === "22023") {
     return NextResponse.json({ error: err.message }, { status: 400 });
   }
-  console.error("[members route] unexpected RPC error:", err);
+  console.error("[members route] unexpected error:", err);
   return NextResponse.json(
     { error: "Failed to update member" },
     { status: 500 },
@@ -69,8 +58,6 @@ export async function PATCH(
       );
     }
 
-    // The RPC blocks promotion to / demotion from owner, but
-    // surface the friendlier 400 before crossing the wire too.
     if (role === "owner") {
       return NextResponse.json(
         {
@@ -81,12 +68,12 @@ export async function PATCH(
       );
     }
 
-    const { error } = await ctx.supabase.rpc("set_member_role", {
-      p_user_id: userId,
-      p_new_role: role,
-    });
-
-    if (error) return rpcErrorToResponse(error);
+    try {
+      await setMemberRole(ctx.userId, userId, role);
+    } catch (err) {
+      if (err instanceof SqlStateError) return rpcErrorToResponse(err);
+      throw err;
+    }
 
     return NextResponse.json({ ok: true });
   } catch (err) {
@@ -109,13 +96,15 @@ export async function DELETE(
 
     const { userId } = await params;
 
-    const { data, error } = await ctx.supabase.rpc("remove_account_member", {
-      p_user_id: userId,
-    });
+    let newPersonalAccountId: string;
+    try {
+      newPersonalAccountId = await removeAccountMember(ctx.userId, userId);
+    } catch (err) {
+      if (err instanceof SqlStateError) return rpcErrorToResponse(err);
+      throw err;
+    }
 
-    if (error) return rpcErrorToResponse(error);
-
-    return NextResponse.json({ ok: true, newPersonalAccountId: data });
+    return NextResponse.json({ ok: true, newPersonalAccountId });
   } catch (err) {
     return toErrorResponse(err);
   }

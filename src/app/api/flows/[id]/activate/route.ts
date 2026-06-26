@@ -1,108 +1,89 @@
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { supabaseAdmin } from '@/lib/flows/admin-client'
-import { validateFlowForActivation } from '@/lib/flows/validate'
+import { NextResponse } from "next/server";
 
-/**
- * POST /api/flows/[id]/activate
- *
- * Body: { status: 'draft' | 'active' | 'archived' }
- *
- * Activating runs the full validator and refuses on any 'error'
- * severity issue. Drafts and archives are unconditional — users
- * need to be able to save broken-work-in-progress and pause flows
- * without first fixing them.
- *
- * Returns the updated flow on success; on validation failure returns
- * the full issue list so the builder can highlight each problem.
- */
+import { getCurrentAccount, toErrorResponse } from "@/lib/auth/account";
+import { validateFlowForActivation } from "@/lib/flows/validate";
+import { serializeFlow } from "@/lib/db/api-serialize";
+import { prisma } from "@/lib/prisma";
 
 export async function POST(
   request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await context.params
+  try {
+    const ctx = await getCurrentAccount();
+    const { id } = await context.params;
 
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const body = (await request.json().catch(() => null)) as
-    | { status?: 'draft' | 'active' | 'archived' }
-    | null
-  const status = body?.status
-  if (!status || !['draft', 'active', 'archived'].includes(status)) {
-    return NextResponse.json(
-      { error: "status must be one of 'draft' | 'active' | 'archived'" },
-      { status: 400 },
-    )
-  }
-
-  // Ownership via RLS — caller's client.
-  const { data: existing } = await supabase
-    .from('flows')
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (!existing) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-
-  const admin = supabaseAdmin()
-
-  if (status === 'active') {
-    // Re-load with the full payload the validator needs.
-    const [{ data: flow }, { data: nodes }] = await Promise.all([
-      admin
-        .from('flows')
-        .select('name, trigger_type, trigger_config, entry_node_id')
-        .eq('id', id)
-        .maybeSingle(),
-      admin
-        .from('flow_nodes')
-        .select('node_key, node_type, config')
-        .eq('flow_id', id),
-    ])
-    if (!flow) {
-      return NextResponse.json({ error: 'Not found' }, { status: 404 })
-    }
-    const issues = validateFlowForActivation(
-      flow as {
-        name: string
-        trigger_type: 'keyword' | 'first_inbound_message' | 'manual'
-        trigger_config: Record<string, unknown>
-        entry_node_id: string | null
-      },
-      (nodes ?? []) as Array<{
-        node_key: string
-        node_type: string
-        config: Record<string, unknown>
-      }>,
-    )
-    const blockers = issues.filter((i) => i.severity === 'error')
-    if (blockers.length > 0) {
+    const body = (await request.json().catch(() => null)) as
+      | { status?: "draft" | "active" | "archived" }
+      | null;
+    const status = body?.status;
+    if (!status || !["draft", "active", "archived"].includes(status)) {
       return NextResponse.json(
-        {
-          error: 'Cannot activate flow — fix the issues below first.',
-          issues,
-        },
-        { status: 422 },
-      )
+        { error: "status must be one of 'draft' | 'active' | 'archived'" },
+        { status: 400 },
+      );
     }
-  }
 
-  const { data: updated, error } = await admin
-    .from('flows')
-    .update({ status, updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .select()
-    .maybeSingle()
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    const existing = await prisma.flow.findFirst({
+      where: { id, accountId: ctx.accountId },
+      select: { id: true },
+    });
+    if (!existing) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
+    if (status === "active") {
+      const flow = await prisma.flow.findFirst({
+        where: { id, accountId: ctx.accountId },
+        select: {
+          name: true,
+          triggerType: true,
+          triggerConfig: true,
+          entryNodeId: true,
+        },
+      });
+      const nodes = await prisma.flowNode.findMany({
+        where: { flowId: id },
+        select: { nodeKey: true, nodeType: true, config: true },
+      });
+
+      if (!flow) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+      }
+
+      const issues = validateFlowForActivation(
+        {
+          name: flow.name,
+          trigger_type: flow.triggerType,
+          trigger_config: flow.triggerConfig as Record<string, unknown>,
+          entry_node_id: flow.entryNodeId,
+        },
+        nodes.map((n) => ({
+          node_key: n.nodeKey,
+          node_type: n.nodeType,
+          config: n.config as Record<string, unknown>,
+        })),
+      );
+
+      const blockers = issues.filter((i) => i.severity === "error");
+      if (blockers.length > 0) {
+        return NextResponse.json(
+          {
+            error: "Cannot activate flow — fix the issues below first.",
+            issues,
+          },
+          { status: 422 },
+        );
+      }
+    }
+
+    const updated = await prisma.flow.update({
+      where: { id },
+      data: { status },
+    });
+
+    return NextResponse.json({ flow: serializeFlow(updated) });
+  } catch (err) {
+    return toErrorResponse(err);
   }
-  return NextResponse.json({ flow: updated })
 }

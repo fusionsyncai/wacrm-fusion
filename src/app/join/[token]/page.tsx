@@ -51,7 +51,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { createClient } from '@/lib/supabase/client';
+import { useSession, signOut } from 'next-auth/react';
 
 interface PeekOk {
   ok: true;
@@ -93,6 +93,7 @@ const FAIL_COPY: Record<PeekFail['reason'], { title: string; body: string }> = {
 export default function JoinPage() {
   const params = useParams<{ token: string }>();
   const token = params?.token;
+  const { data: session, status } = useSession();
 
   const [peek, setPeek] = useState<PeekResult | null>(null);
   // Local auth probe — the AuthProvider lives inside the (dashboard)
@@ -116,41 +117,35 @@ export default function JoinPage() {
     setPeek(null);
     setAuthedUserId(undefined);
     try {
-      const [peekRes, authRes] = await Promise.all([
-        fetch(`/api/invitations/${encodeURIComponent(token)}/peek`, {
-          cache: 'no-store',
-        }),
-        createClient().auth.getUser(),
-      ]);
+      const peekRes = await fetch(`/api/invitations/${encodeURIComponent(token)}/peek`, {
+        cache: 'no-store',
+      });
       const peekBody = (await peekRes.json()) as PeekResult;
       setPeek(peekBody);
-      setAuthedUserId(authRes.data.user?.id ?? null);
+      setAuthedUserId(session?.user?.id ?? null);
     } catch (err) {
       console.error('[join] peek error:', err);
       setPeek({ ok: false, reason: 'server_error' });
       setAuthedUserId(null);
     }
-  }, [token]);
+  }, [token, session?.user?.id]);
 
   // Fetch peek + auth state on mount. The peek endpoint is
   // rate-limited per-IP (30/min) so double-mounting in React 19
   // strict mode dev is harmless. We also use the `cancelled` flag
   // to drop setState calls if the component unmounts mid-fetch.
   useEffect(() => {
-    if (!token) return;
+    if (!token || status === 'loading') return;
     let cancelled = false;
     (async () => {
       try {
-        const [peekRes, authRes] = await Promise.all([
-          fetch(`/api/invitations/${encodeURIComponent(token)}/peek`, {
-            cache: 'no-store',
-          }),
-          createClient().auth.getUser(),
-        ]);
+        const peekRes = await fetch(`/api/invitations/${encodeURIComponent(token)}/peek`, {
+          cache: 'no-store',
+        });
         const peekBody = (await peekRes.json()) as PeekResult;
         if (cancelled) return;
         setPeek(peekBody);
-        setAuthedUserId(authRes.data.user?.id ?? null);
+        setAuthedUserId(session?.user?.id ?? null);
       } catch (err) {
         console.error('[join] peek error:', err);
         if (cancelled) return;
@@ -161,7 +156,7 @@ export default function JoinPage() {
     return () => {
       cancelled = true;
     };
-  }, [token]);
+  }, [token, session?.user?.id, status]);
 
   const handleAccept = useCallback(async () => {
     if (!token) return;
@@ -205,7 +200,7 @@ export default function JoinPage() {
   const handleSignOutAndRetry = useCallback(async () => {
     setSigningOut(true);
     try {
-      await createClient().auth.signOut();
+      await signOut({ redirect: false });
       // Hard reload so the new auth state propagates everywhere
       // (middleware, AuthProvider). Preserves the invite token in
       // the URL so the rebuilt page renders the signed-out CTA path.

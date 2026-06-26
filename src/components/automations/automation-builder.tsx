@@ -51,7 +51,7 @@ import type {
   MessageTemplate,
   Tag as TagRecord,
 } from "@/types"
-import { createClient } from "@/lib/supabase/client"
+import { fetchJson } from "@/lib/api/fetch-json"
 import { cn } from "@/lib/utils"
 
 // ------------------------------------------------------------
@@ -202,26 +202,19 @@ function ResourcesProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false
-    const supabase = createClient()
 
-    // Tags, templates and custom fields come straight from the DB — RLS
-    // scopes them to the caller's account. Only APPROVED templates can
-    // actually be sent (anything else 400s at send time), matching the
-    // broadcast picker.
     void (async () => {
       const [tagsRes, templatesRes, customFieldsRes] = await Promise.all([
-        supabase.from("tags").select("*").order("name"),
-        supabase
-          .from("message_templates")
-          .select("*")
-          .eq("status", "APPROVED")
-          .order("name"),
-        supabase.from("custom_fields").select("*").order("field_name"),
+        fetchJson<{ tags: TagRecord[] }>("/api/data/tags"),
+        fetchJson<{ templates: MessageTemplate[] }>(
+          "/api/data/message-templates?status=APPROVED",
+        ),
+        fetchJson<{ custom_fields: CustomField[] }>("/api/data/custom-fields"),
       ])
       if (cancelled) return
-      setTags((tagsRes.data as TagRecord[] | null) ?? [])
-      setTemplates((templatesRes.data as MessageTemplate[] | null) ?? [])
-      setCustomFields((customFieldsRes.data as CustomField[] | null) ?? [])
+      setTags(tagsRes.tags ?? [])
+      setTemplates(templatesRes.templates ?? [])
+      setCustomFields(customFieldsRes.custom_fields ?? [])
     })()
 
     // Members go through the API so we inherit its email-visibility

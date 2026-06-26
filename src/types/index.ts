@@ -143,6 +143,7 @@ export interface ContactNote {
 }
 
 export type ConversationStatus = 'open' | 'pending' | 'closed';
+export type ConversationHandlingMode = 'AGENT' | 'HUMAN';
 
 export interface Conversation {
   id: string;
@@ -150,12 +151,15 @@ export interface Conversation {
   contact_id: string;
   status: ConversationStatus;
   assigned_agent_id?: string;
+  ai_agent_id?: string;
+  handling_mode?: ConversationHandlingMode;
   last_message_text?: string;
   last_message_at?: string;
   unread_count: number;
   created_at: string;
   updated_at: string;
   contact?: Contact;
+  ai_agent?: AiAgent;
 }
 
 export type SenderType = 'customer' | 'agent' | 'bot';
@@ -169,7 +173,7 @@ export type ContentType =
   | 'template'
   /** Customer tapped a reply button or list row on a message we sent. */
   | 'interactive';
-export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed' | 'draft';
 
 export interface Message {
   id: string;
@@ -541,4 +545,48 @@ export interface AutomationLog {
   error_message?: string | null;
   created_at: string;
   contact?: Contact;
+}
+
+// ---------------------------------------------------------------------------
+// AI agents & LLM
+// ---------------------------------------------------------------------------
+
+export type LlmProvider = 'OPENAI' | 'GEMINI' | 'OPEN_ROUTER' | 'GROQ';
+export type AgentReplyMode = 'AUTO' | 'HUMAN';
+
+export interface AiAgentToolParameter {
+  field: string;
+  type: 'string' | 'number' | 'boolean';
+  description: string;
+}
+
+export interface AiAgentTool {
+  id: string;
+  agent_id: string;
+  name: string;
+  description: string;
+  parameters: AiAgentToolParameter[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AiAgent {
+  id: string;
+  account_id: string;
+  name: string;
+  description?: string;
+  system_prompt: string;
+  reply_mode: AgentReplyMode;
+  auto_connect: boolean;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+  tools?: AiAgentTool[];
+}
+
+export interface AccountLlmConfig {
+  provider: LlmProvider;
+  model_id: string;
+  has_api_key: boolean;
+  is_default: boolean;
 }

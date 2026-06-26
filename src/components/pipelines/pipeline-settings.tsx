@@ -16,7 +16,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { createClient } from "@/lib/supabase/client";
+import { fetchJson } from "@/lib/api/fetch-json";
 import type { Pipeline, PipelineStage } from "@/types";
 import {
   Dialog,
@@ -68,8 +68,6 @@ export function PipelineSettings({
   onStagesChanged,
   onCreateNewPipeline,
 }: PipelineSettingsProps) {
-  const supabase = createClient();
-
   const [name, setName] = useState(pipeline.name);
   const [localStages, setLocalStages] = useState<PipelineStage[]>(stages);
   const [newStageName, setNewStageName] = useState("");
@@ -116,85 +114,86 @@ export function PipelineSettings({
       position: i,
     }));
 
-    const [renameRes, stagesRes] = await Promise.all([
-      supabase
-        .from("pipelines")
-        .update({ name: name.trim() })
-        .eq("id", pipeline.id),
-      supabase.from("pipeline_stages").upsert(stageRows, { onConflict: "id" }),
-    ]);
-
-    setSaving(false);
-
-    if (renameRes.error || stagesRes.error) {
-      toast.error("Failed to save pipeline");
-      return;
+    try {
+      await Promise.all([
+        fetchJson(`/api/data/pipelines/${pipeline.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ name: name.trim() }),
+        }),
+        fetchJson('/api/data/pipeline-stages', {
+          method: 'POST',
+          body: JSON.stringify({ stages: stageRows }),
+        }),
+      ]);
+      onOpenChange(false);
+      onPipelinesChanged();
+      onStagesChanged();
+      toast.success('Pipeline saved');
+    } catch {
+      toast.error('Failed to save pipeline');
+    } finally {
+      setSaving(false);
     }
-
-    onOpenChange(false);
-    onPipelinesChanged();
-    onStagesChanged();
-    toast.success("Pipeline saved");
   }
 
   async function handleAddStage() {
     const trimmed = newStageName.trim();
     if (!trimmed) return;
-    const { data, error } = await supabase
-      .from("pipeline_stages")
-      .insert({
-        pipeline_id: pipeline.id,
-        name: trimmed,
-        color: newStageColor,
-        position: localStages.length,
-      })
-      .select()
-      .single();
-    if (error || !data) {
-      toast.error("Failed to add stage");
-      return;
+    try {
+      const { stage: data } = await fetchJson<{ stage: PipelineStage }>(
+        '/api/data/pipeline-stages',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            pipeline_id: pipeline.id,
+            name: trimmed,
+            color: newStageColor,
+            position: localStages.length,
+          }),
+        },
+      );
+      setLocalStages([...localStages, data]);
+      setNewStageName('');
+      setNewStageColor(STAGE_COLORS[(localStages.length + 1) % STAGE_COLORS.length]);
+    } catch {
+      toast.error('Failed to add stage');
     }
-    setLocalStages([...localStages, data as PipelineStage]);
-    setNewStageName("");
-    setNewStageColor(STAGE_COLORS[(localStages.length + 1) % STAGE_COLORS.length]);
   }
 
   async function handleRemoveStage(stageId: string) {
     // Refuse to delete if deals still reference the stage (FK would fail).
-    const { count } = await supabase
-      .from("deals")
-      .select("id", { count: "exact", head: true })
-      .eq("stage_id", stageId);
-    if (count && count > 0) {
-      toast.error("Move or delete deals in this stage first");
+    const { deals } = await fetchJson<{ deals: Array<{ stage_id: string }> }>(
+      `/api/data/deals?pipeline_id=${pipeline.id}`,
+    );
+    const count = (deals ?? []).filter((d) => d.stage_id === stageId).length;
+    if (count > 0) {
+      toast.error('Move or delete deals in this stage first');
       return;
     }
-    const { error } = await supabase
-      .from("pipeline_stages")
-      .delete()
-      .eq("id", stageId);
-    if (error) {
-      toast.error("Failed to delete stage");
-      return;
+    try {
+      await fetchJson('/api/data/pipeline-stages', {
+        method: 'DELETE',
+        body: JSON.stringify({ id: stageId }),
+      });
+      setLocalStages(localStages.filter((s) => s.id !== stageId));
+    } catch {
+      toast.error('Failed to delete stage');
     }
-    setLocalStages(localStages.filter((s) => s.id !== stageId));
   }
 
   async function handleDeletePipeline() {
     setDeleting(true);
     // ON DELETE CASCADE handles deals + stages.
-    const { error } = await supabase
-      .from("pipelines")
-      .delete()
-      .eq("id", pipeline.id);
-    setDeleting(false);
-    if (error) {
-      toast.error("Failed to delete pipeline");
-      return;
+    try {
+      await fetchJson(`/api/data/pipelines/${pipeline.id}`, { method: 'DELETE' });
+      onOpenChange(false);
+      onPipelinesChanged();
+      toast.success('Pipeline deleted');
+    } catch {
+      toast.error('Failed to delete pipeline');
+    } finally {
+      setDeleting(false);
     }
-    onOpenChange(false);
-    onPipelinesChanged();
-    toast.success("Pipeline deleted");
   }
 
   return (

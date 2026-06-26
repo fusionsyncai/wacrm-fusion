@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import type { Prisma } from '@/generated/prisma/client'
+import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account'
+import { prisma } from '@/lib/prisma'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
 import type { TemplateButton, TemplateSampleValues } from '@/types'
@@ -124,39 +126,15 @@ function extractSampleValues(
 
 export async function POST() {
   try {
-    const supabase = await createClient()
+    const ctx = await getCurrentAccount()
+    const accountId = ctx.accountId
+    const userId = ctx.userId
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
+    const config = await prisma.whatsappConfig.findUnique({
+      where: { accountId },
+    })
 
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    // Resolve the caller's account_id — both whatsapp_config and
-    // the message_templates we sync into are account-scoped.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
-
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
-
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         {
           error:
@@ -166,7 +144,7 @@ export async function POST() {
       )
     }
 
-    if (!config.waba_id) {
+    if (!config.wabaId) {
       return NextResponse.json(
         {
           error:
@@ -176,12 +154,12 @@ export async function POST() {
       )
     }
 
-    const accessToken = decrypt(config.access_token)
+    const accessToken = decrypt(config.accessToken)
 
     const metaTemplates: MetaTemplate[] = []
     let nextUrl:
       | string
-      | null = `${META_API_BASE}/${config.waba_id}/message_templates?limit=100&fields=id,name,language,status,category,components,quality_score`
+      | null = `${META_API_BASE}/${config.wabaId}/message_templates?limit=100&fields=id,name,language,status,category,components,quality_score`
     const PAGE_CAP = 20
     let pageCount = 0
 
@@ -232,72 +210,50 @@ export async function POST() {
           ? headerFormat.toLowerCase()
           : null
 
-      const row = {
-        // Account tenancy + user audit, same split as the submit
-        // route. account_id is NOT NULL on message_templates
-        // post-017, so an INSERT without it errors.
-        account_id: accountId,
-        user_id: user.id,
+      const rowData = {
+        accountId,
+        userId,
         name: t.name,
         category: normalizeCategory(t.category),
         language: t.language,
-        header_type: headerType,
-        header_content: header?.text ?? null,
-        header_handle: header?.example?.header_handle?.[0] ?? null,
-        body_text: body?.text ?? '',
-        footer_text: footer?.text ?? null,
-        buttons: parsedButtons.length ? parsedButtons : null,
-        sample_values: sampleValues,
-        status: normalizeStatus(t.status),
-        meta_template_id: t.id,
-        quality_score: normalizeQualityScore(t.quality_score),
-        updated_at: new Date().toISOString(),
+        headerType: headerType as import('@/generated/prisma/client').MessageTemplateHeaderType | null,
+        headerContent: header?.text ?? null,
+        headerHandle: header?.example?.header_handle?.[0] ?? null,
+        bodyText: body?.text ?? '',
+        footerText: footer?.text ?? null,
+        buttons: parsedButtons.length ? parsedButtons : undefined,
+        sampleValues: (sampleValues ?? undefined) as Prisma.InputJsonValue | undefined,
+        status: normalizeStatus(t.status) as import('@/generated/prisma/client').MessageTemplateStatus,
+        metaTemplateId: t.id,
+        qualityScore: normalizeQualityScore(t.quality_score),
       }
 
-      const { data: existing, error: lookupErr } = await supabase
-        .from('message_templates')
-        .select('id')
-        .eq('account_id', accountId)
-        .eq('name', t.name)
-        .eq('language', t.language)
-        .maybeSingle()
+      const existing = await prisma.messageTemplate.findFirst({
+        where: {
+          accountId,
+          name: t.name,
+          language: t.language,
+        },
+        select: { id: true },
+      })
 
-      if (lookupErr) {
+      try {
+        if (existing?.id) {
+          await prisma.messageTemplate.update({
+            where: { id: existing.id },
+            data: rowData,
+          })
+          updated++
+        } else {
+          await prisma.messageTemplate.create({ data: rowData })
+          inserted++
+        }
+      } catch (err) {
         errors.push({
           name: t.name,
           language: t.language,
-          message: lookupErr.message,
+          message: err instanceof Error ? err.message : 'upsert failed',
         })
-        continue
-      }
-
-      if (existing?.id) {
-        const { error: updErr } = await supabase
-          .from('message_templates')
-          .update(row)
-          .eq('id', existing.id)
-        if (updErr) {
-          errors.push({
-            name: t.name,
-            language: t.language,
-            message: updErr.message,
-          })
-        } else {
-          updated++
-        }
-      } else {
-        const { error: insErr } = await supabase
-          .from('message_templates')
-          .insert(row)
-        if (insErr) {
-          errors.push({
-            name: t.name,
-            language: t.language,
-            message: insErr.message,
-          })
-        } else {
-          inserted++
-        }
       }
     }
 
@@ -310,6 +266,12 @@ export async function POST() {
       truncated: pageCount >= PAGE_CAP && nextUrl !== null,
     })
   } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === 'UnauthorizedError' || error.name === 'ForbiddenError')
+    ) {
+      return toErrorResponse(error)
+    }
     console.error('Error syncing WhatsApp templates:', error)
     return NextResponse.json(
       {

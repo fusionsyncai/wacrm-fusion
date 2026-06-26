@@ -3,8 +3,8 @@
 import { useState } from 'react';
 import { toast } from 'sonner';
 import { Loader2, LogOut } from 'lucide-react';
+import { signOut } from 'next-auth/react';
 
-import { createClient } from '@/lib/supabase/client';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -23,26 +23,16 @@ import {
 } from '@/components/ui/dialog';
 
 export function SessionsCard() {
-  const supabase = createClient();
   const [open, setOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
 
   const onConfirm = async () => {
     setSigningOut(true);
     try {
-      // scope: 'global' revokes every refresh token for this user
-      // across all devices; the next auth-state change on this tab
-      // triggers the usual redirect.
-      const { error } = await supabase.auth.signOut({ scope: 'global' });
-      if (error) {
-        toast.error(`Sign-out failed: ${error.message}`);
-        return;
-      }
-      window.location.href = '/login';
+      await signOut({ callbackUrl: '/login' });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       toast.error(msg);
-    } finally {
       setSigningOut(false);
     }
   };
@@ -56,8 +46,9 @@ export function SessionsCard() {
             Active sessions
           </CardTitle>
           <CardDescription className="text-muted-foreground">
-            Sign out of every device where you&apos;re logged in — including
-            this one. Useful if you lost a laptop or shared your password.
+            Sign out of this device. NextAuth JWT sessions do not support
+            revoking all devices remotely yet — use password change if you
+            suspect your credentials were compromised.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -67,7 +58,7 @@ export function SessionsCard() {
             onClick={() => setOpen(true)}
           >
             <LogOut className="size-4" />
-            Sign out of all devices
+            Sign out
           </Button>
         </CardContent>
       </Card>
@@ -75,10 +66,9 @@ export function SessionsCard() {
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Sign out everywhere?</DialogTitle>
+            <DialogTitle>Sign out?</DialogTitle>
             <DialogDescription>
-              Every device logged into this account will be signed out and
-              will need to log in again. You will be redirected to the login
+              You will be signed out on this device and redirected to the login
               page.
             </DialogDescription>
           </DialogHeader>
@@ -98,7 +88,7 @@ export function SessionsCard() {
                   Signing out…
                 </>
               ) : (
-                'Sign out everywhere'
+                'Sign out'
               )}
             </Button>
           </DialogFooter>

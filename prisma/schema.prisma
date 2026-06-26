@@ -1,0 +1,1008 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Native PostgreSQL enum (migration 017)
+// ---------------------------------------------------------------------------
+
+enum AccountRole {
+  owner
+  admin
+  agent
+  viewer
+
+  @@map("account_role_enum")
+}
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint enums (TEXT columns in Postgres)
+// ---------------------------------------------------------------------------
+
+enum ConversationStatus {
+  open
+  pending
+  closed
+}
+
+enum MessageSenderType {
+  customer
+  agent
+  bot
+}
+
+enum MessageContentType {
+  text
+  image
+  document
+  audio
+  video
+  location
+  template
+  interactive
+}
+
+enum MessageStatus {
+  sending
+  sent
+  delivered
+  read
+  failed
+  draft
+}
+
+enum WhatsappConfigStatus {
+  connected
+  disconnected
+}
+
+enum MessageTemplateCategory {
+  Marketing
+  Utility
+  Authentication
+}
+
+enum MessageTemplateHeaderType {
+  text
+  image
+  video
+  document
+}
+
+enum MessageTemplateStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  PAUSED
+  DISABLED
+  IN_APPEAL
+  PENDING_DELETION
+}
+
+enum MessageTemplateQualityScore {
+  GREEN
+  YELLOW
+  RED
+}
+
+enum DealStatus {
+  open
+  won
+  lost
+}
+
+enum BroadcastStatus {
+  draft
+  scheduled
+  sending
+  sent
+  failed
+}
+
+enum BroadcastRecipientStatus {
+  pending
+  sent
+  delivered
+  read
+  replied
+  failed
+}
+
+enum AutomationBranch {
+  yes
+  no
+}
+
+enum AutomationLogStatus {
+  success
+  partial
+  failed
+}
+
+enum AutomationPendingStatus {
+  pending
+  running
+  done
+  failed
+}
+
+enum FlowStatus {
+  draft
+  active
+  archived
+}
+
+enum FlowTriggerType {
+  keyword
+  first_inbound_message
+  manual
+}
+
+enum FlowNodeType {
+  start
+  send_buttons
+  send_list
+  send_message
+  send_media
+  collect_input
+  condition
+  set_tag
+  handoff
+  http_fetch
+  end
+}
+
+enum FlowRunStatus {
+  active
+  completed
+  handed_off
+  timed_out
+  paused_by_agent
+  failed
+}
+
+enum FlowRunEventType {
+  started
+  node_entered
+  message_sent
+  reply_received
+  fallback_fired
+  handoff
+  timeout
+  error
+  completed
+}
+
+enum MessageReactionActorType {
+  customer
+  agent
+}
+
+enum MemberPresenceStatus {
+  online
+  away
+}
+
+enum LlmProvider {
+  OPENAI
+  GEMINI
+  OPEN_ROUTER
+  GROQ
+}
+
+enum AgentReplyMode {
+  AUTO
+  HUMAN
+}
+
+enum ConversationHandlingMode {
+  AGENT
+  HUMAN
+}
+
+// ---------------------------------------------------------------------------
+// NextAuth (Auth.js) — credentials identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name          String?
+  email         String    @unique
+  emailVerified DateTime? @map("email_verified") @db.Timestamptz(6)
+  image         String?
+  passwordHash  String?   @map("password_hash")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  profile              Profile?
+  authProviderAccounts AuthProviderAccount[]
+  sessions             Session[]
+  ownedAccounts        Account[]             @relation("AccountOwner")
+
+  @@map("users")
+}
+
+model AuthProviderAccount {
+  id                String  @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId            String  @map("user_id") @db.Uuid
+  type              String
+  provider          String
+  providerAccountId String  @map("provider_account_id")
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("auth_provider_accounts")
+}
+
+model Session {
+  id           String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  sessionToken String   @unique @map("session_token")
+  userId       String   @map("user_id") @db.Uuid
+  expires      DateTime @db.Timestamptz(6)
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime @db.Timestamptz(6)
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Accounts & membership (workspace tenancy)
+// ---------------------------------------------------------------------------
+
+model Account {
+  id              String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name            String
+  ownerUserId     String   @map("owner_user_id") @db.Uuid
+  defaultCurrency String   @default("USD") @map("default_currency")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  owner                        User                 @relation("AccountOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  profiles                     Profile[]
+  accountInvitations           AccountInvitation[]
+  contacts                     Contact[]
+  tags                         Tag[]
+  customFields                 CustomField[]
+  contactNotes                 ContactNote[]
+  conversations                Conversation[]
+  whatsappConfigs              WhatsappConfig[]
+  messageTemplates             MessageTemplate[]
+  pipelines                    Pipeline[]
+  deals                        Deal[]
+  broadcasts                   Broadcast[]
+  automations                  Automation[]
+  automationLogs               AutomationLog[]
+  automationPendingExecutions  AutomationPendingExecution[]
+  flows                        Flow[]
+  flowRuns                     FlowRun[]
+  memberPresences              MemberPresence[]
+  apiKeys                      ApiKey[]
+  llmConfigs                   AccountLlmConfig[]
+  aiAgents                     AiAgent[]
+
+  @@unique([ownerUserId], map: "idx_accounts_one_per_owner")
+  @@map("accounts")
+}
+
+model AccountInvitation {
+  id               String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId        String      @map("account_id") @db.Uuid
+  tokenHash        String      @unique @map("token_hash")
+  role             AccountRole
+  createdByUserId  String?     @map("created_by_user_id") @db.Uuid
+  label            String?
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt        DateTime    @map("expires_at") @db.Timestamptz(6)
+  acceptedAt       DateTime?   @map("accepted_at") @db.Timestamptz(6)
+  acceptedByUserId String?     @map("accepted_by_user_id") @db.Uuid
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, expiresAt], map: "idx_account_invitations_account_pending")
+  /// Partial index: WHERE accepted_at IS NULL
+  @@map("account_invitations")
+}
+
+model Profile {
+  id           String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId       String      @unique @map("user_id") @db.Uuid
+  fullName     String      @map("full_name")
+  email        String
+  avatarUrl    String?     @map("avatar_url")
+  role         String?     @default("user")
+  betaFeatures String[]    @default([]) @map("beta_features")
+  accountId    String      @map("account_id") @db.Uuid
+  accountRole  AccountRole @map("account_role")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account      Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  assignedDeals Deal[] @relation("DealAssignee")
+
+  @@index([accountId, accountRole], map: "idx_profiles_account_role")
+  @@map("profiles")
+}
+
+model MemberPresence {
+  userId     String               @id @map("user_id") @db.Uuid
+  accountId  String               @map("account_id") @db.Uuid
+  status     MemberPresenceStatus @default(online)
+  lastSeenAt DateTime             @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId], map: "member_presence_account_idx")
+  @@map("member_presence")
+}
+
+model ApiKey {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId  String    @map("account_id") @db.Uuid
+  createdBy  String?   @map("created_by") @db.Uuid
+  name       String
+  keyPrefix  String    @map("key_prefix")
+  keyHash    String    @unique @map("key_hash")
+  scopes     String[]  @default([])
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId], map: "api_keys_account_id_idx")
+  @@index([keyHash], map: "api_keys_key_hash_idx")
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// AI agents & LLM configuration
+// ---------------------------------------------------------------------------
+
+model AccountLlmConfig {
+  id        String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId String      @map("account_id") @db.Uuid
+  provider  LlmProvider
+  modelId   String      @map("model_id")
+  apiKey    String      @map("api_key")
+  isDefault Boolean     @default(false) @map("is_default")
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, provider], map: "idx_account_llm_configs_account_provider")
+  @@index([accountId], map: "idx_account_llm_configs_account")
+  @@map("account_llm_configs")
+}
+
+model AiAgent {
+  id           String         @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId    String         @map("account_id") @db.Uuid
+  name         String
+  description  String?
+  systemPrompt String         @map("system_prompt")
+  replyMode    AgentReplyMode @default(HUMAN) @map("reply_mode")
+  autoConnect  Boolean        @default(false) @map("auto_connect")
+  isActive     Boolean        @default(false) @map("is_active")
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account       Account        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  tools         AiAgentTool[]
+  conversations Conversation[]
+
+  @@index([accountId], map: "idx_ai_agents_account")
+  @@map("ai_agents")
+}
+
+model AiAgentTool {
+  id          String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  agentId     String   @map("agent_id") @db.Uuid
+  name        String
+  description String
+  parameters  Json     @default("[]")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  agent AiAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, name], map: "idx_ai_agent_tools_agent_name")
+  @@index([agentId], map: "idx_ai_agent_tools_agent")
+  @@map("ai_agent_tools")
+}
+
+// ---------------------------------------------------------------------------
+// Contacts & CRM
+// ---------------------------------------------------------------------------
+
+model Contact {
+  id          String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  accountId   String   @map("account_id") @db.Uuid
+  phone       String
+  /// GENERATED ALWAYS AS (regexp_replace(phone, '\D', '', 'g')) STORED — not writable via Prisma
+  phoneNormalized Unsupported("text")? @map("phone_normalized")
+  name        String?
+  email       String?
+  company     String?
+  avatarUrl   String?  @map("avatar_url")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account                      Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contactTags                  ContactTag[]
+  contactCustomValues          ContactCustomValue[]
+  contactNotes                 ContactNote[]
+  conversations                Conversation[]
+  deals                        Deal[]
+  broadcastRecipients          BroadcastRecipient[]
+  automationLogs               AutomationLog[]
+  automationPendingExecutions  AutomationPendingExecution[]
+  flowRuns                     FlowRun[]
+
+  @@index([userId], map: "idx_contacts_user_id")
+  @@index([phone], map: "idx_contacts_phone")
+  @@index([accountId], map: "idx_contacts_account")
+  /// Partial unique index: CREATE UNIQUE INDEX idx_contacts_account_phone_normalized ON contacts (account_id, phone_normalized) WHERE phone_normalized <> ''
+  @@map("contacts")
+}
+
+model Tag {
+  id        String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  accountId String   @map("account_id") @db.Uuid
+  name      String
+  color     String   @default("#3b82f6")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  account     Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contactTags ContactTag[]
+
+  @@index([accountId], map: "idx_tags_account")
+  @@map("tags")
+}
+
+model ContactTag {
+  id        String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  contactId String   @map("contact_id") @db.Uuid
+  tagId     String   @map("tag_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, tagId])
+  @@index([contactId], map: "idx_contact_tags_contact")
+  @@index([tagId], map: "idx_contact_tags_tag")
+  @@map("contact_tags")
+}
+
+model CustomField {
+  id           String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  accountId    String   @map("account_id") @db.Uuid
+  fieldName    String   @map("field_name")
+  fieldType    String   @default("text") @map("field_type")
+  fieldOptions Json?    @map("field_options")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  account             Account              @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contactCustomValues ContactCustomValue[]
+
+  @@index([accountId], map: "idx_custom_fields_account")
+  @@map("custom_fields")
+}
+
+model ContactCustomValue {
+  id            String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  contactId     String   @map("contact_id") @db.Uuid
+  customFieldId String   @map("custom_field_id") @db.Uuid
+  value         String?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  contact     Contact     @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  customField CustomField @relation(fields: [customFieldId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, customFieldId])
+  @@map("contact_custom_values")
+}
+
+model ContactNote {
+  id        String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  contactId String   @map("contact_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  accountId String   @map("account_id") @db.Uuid
+  noteText  String   @map("note_text")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId], map: "idx_contact_notes_account")
+  @@map("contact_notes")
+}
+
+// ---------------------------------------------------------------------------
+// Conversations & messages
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id               String                     @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId           String                     @map("user_id") @db.Uuid
+  accountId        String                     @map("account_id") @db.Uuid
+  contactId        String                     @map("contact_id") @db.Uuid
+  status           ConversationStatus         @default(open)
+  assignedAgentId  String?                    @map("assigned_agent_id") @db.Uuid
+  aiAgentId        String?                    @map("ai_agent_id") @db.Uuid
+  handlingMode     ConversationHandlingMode   @default(AGENT) @map("handling_mode")
+  lastMessageText  String?                    @map("last_message_text")
+  lastMessageAt    DateTime?                  @map("last_message_at") @db.Timestamptz(6)
+  unreadCount      Int                        @default(0) @map("unread_count")
+  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account          Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contact          Contact           @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  aiAgent          AiAgent?          @relation(fields: [aiAgentId], references: [id], onDelete: SetNull)
+  messages         Message[]
+  messageReactions MessageReaction[]
+  deals            Deal[]
+  flowRuns         FlowRun[]
+
+  @@index([userId], map: "idx_conversations_user_id")
+  @@index([contactId], map: "idx_conversations_contact_id")
+  @@index([accountId], map: "idx_conversations_account")
+  @@index([aiAgentId], map: "idx_conversations_ai_agent")
+  @@map("conversations")
+}
+
+model Message {
+  id                 String             @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  conversationId     String             @map("conversation_id") @db.Uuid
+  senderType         MessageSenderType  @map("sender_type")
+  senderId           String?            @map("sender_id") @db.Uuid
+  contentType        MessageContentType @default(text) @map("content_type")
+  contentText        String?            @map("content_text")
+  mediaUrl           String?            @map("media_url")
+  templateName       String?            @map("template_name")
+  messageId          String?            @map("message_id")
+  status             MessageStatus      @default(sent)
+  replyToMessageId   String?            @map("reply_to_message_id") @db.Uuid
+  interactiveReplyId String?            @map("interactive_reply_id")
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  conversation     Conversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  replyToMessage   Message?          @relation("MessageReply", fields: [replyToMessageId], references: [id], onDelete: SetNull)
+  replies          Message[]         @relation("MessageReply")
+  messageReactions MessageReaction[]
+  flowRunsAsPrompt FlowRun[]         @relation("FlowRunLastPrompt")
+
+  @@index([conversationId], map: "idx_messages_conversation")
+  @@index([messageId], map: "idx_messages_message_id")
+  @@index([replyToMessageId], map: "idx_messages_reply_to")
+  /// Partial index: WHERE reply_to_message_id IS NOT NULL
+  @@map("messages")
+}
+
+model MessageReaction {
+  id             String                   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  messageId      String                   @map("message_id") @db.Uuid
+  conversationId String                   @map("conversation_id") @db.Uuid
+  actorType      MessageReactionActorType @map("actor_type")
+  actorId        String?                  @map("actor_id") @db.Uuid
+  emoji          String
+  createdAt      DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  message      Message      @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, actorType, actorId])
+  @@index([conversationId], map: "idx_message_reactions_conversation")
+  @@index([messageId], map: "idx_message_reactions_message")
+  @@map("message_reactions")
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp configuration & templates
+// ---------------------------------------------------------------------------
+
+model WhatsappConfig {
+  id                     String               @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId                 String               @map("user_id") @db.Uuid
+  accountId              String               @unique @map("account_id") @db.Uuid
+  phoneNumberId          String               @unique @map("phone_number_id")
+  wabaId                 String?              @map("waba_id")
+  accessToken            String               @map("access_token")
+  verifyToken            String?              @map("verify_token")
+  status                 WhatsappConfigStatus @default(disconnected)
+  connectedAt            DateTime?            @map("connected_at") @db.Timestamptz(6)
+  registeredAt           DateTime?            @map("registered_at") @db.Timestamptz(6)
+  subscribedAppsAt       DateTime?            @map("subscribed_apps_at") @db.Timestamptz(6)
+  lastRegistrationError  String?              @map("last_registration_error")
+  createdAt              DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId], map: "idx_whatsapp_config_account")
+  @@index([registeredAt], map: "idx_whatsapp_config_registered_at")
+  /// Partial index: WHERE registered_at IS NULL
+  @@map("whatsapp_config")
+}
+
+model MessageTemplate {
+  id               String                       @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId           String                       @map("user_id") @db.Uuid
+  accountId        String                       @map("account_id") @db.Uuid
+  name             String
+  category         MessageTemplateCategory      @default(Marketing)
+  language         String?                      @default("en_US")
+  headerType       MessageTemplateHeaderType?   @map("header_type")
+  headerContent    String?                      @map("header_content")
+  bodyText         String                       @map("body_text")
+  footerText       String?                      @map("footer_text")
+  buttons          Json?
+  status           MessageTemplateStatus        @default(DRAFT)
+  sampleValues     Json?                        @map("sample_values")
+  metaTemplateId   String?                      @map("meta_template_id")
+  rejectionReason  String?                      @map("rejection_reason")
+  qualityScore     MessageTemplateQualityScore? @map("quality_score")
+  headerHandle     String?                      @map("header_handle")
+  headerMediaUrl   String?                      @map("header_media_url")
+  submissionError  String?                      @map("submission_error")
+  lastSubmittedAt  DateTime?                    @map("last_submitted_at") @db.Timestamptz(6)
+  createdAt        DateTime                     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name, language], map: "message_templates_user_name_language_key")
+  @@index([accountId], map: "idx_message_templates_account")
+  @@index([metaTemplateId], map: "idx_message_templates_meta_template_id")
+  /// Partial index: WHERE meta_template_id IS NOT NULL
+  @@map("message_templates")
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines & deals
+// ---------------------------------------------------------------------------
+
+model Pipeline {
+  id        String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  accountId String   @map("account_id") @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  account        Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  pipelineStages PipelineStage[]
+  deals          Deal[]
+
+  @@index([accountId], map: "idx_pipelines_account")
+  @@map("pipelines")
+}
+
+model PipelineStage {
+  id         String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  pipelineId String   @map("pipeline_id") @db.Uuid
+  name       String
+  position   Int      @default(0)
+  color      String   @default("#3b82f6")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  pipeline Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  deals    Deal[]
+
+  @@index([pipelineId], map: "idx_pipeline_stages_pipeline")
+  @@map("pipeline_stages")
+}
+
+model Deal {
+  id                String     @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId            String     @map("user_id") @db.Uuid
+  accountId         String     @map("account_id") @db.Uuid
+  pipelineId        String     @map("pipeline_id") @db.Uuid
+  stageId           String     @map("stage_id") @db.Uuid
+  contactId         String?    @map("contact_id") @db.Uuid
+  conversationId    String?    @map("conversation_id") @db.Uuid
+  assignedTo        String?    @map("assigned_to") @db.Uuid
+  title             String
+  value             Decimal    @default(0) @db.Decimal(12, 2)
+  currency          String?    @default("USD")
+  notes             String?
+  expectedCloseDate DateTime?  @map("expected_close_date") @db.Date
+  status            DealStatus @default(open)
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  pipeline     Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  stage        PipelineStage @relation(fields: [stageId], references: [id])
+  contact      Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+  assignee     Profile?      @relation("DealAssignee", fields: [assignedTo], references: [id], onDelete: SetNull)
+
+  @@index([pipelineId], map: "idx_deals_pipeline")
+  @@index([stageId], map: "idx_deals_stage")
+  @@index([assignedTo], map: "idx_deals_assigned_to")
+  @@index([accountId], map: "idx_deals_account")
+  @@map("deals")
+}
+
+// ---------------------------------------------------------------------------
+// Broadcasts
+// ---------------------------------------------------------------------------
+
+model Broadcast {
+  id                String          @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId            String          @map("user_id") @db.Uuid
+  accountId         String          @map("account_id") @db.Uuid
+  name              String
+  templateName      String          @map("template_name")
+  templateLanguage  String          @default("en_US") @map("template_language")
+  templateVariables Json?           @map("template_variables")
+  audienceFilter    Json?           @map("audience_filter")
+  scheduledAt       DateTime?       @map("scheduled_at") @db.Timestamptz(6)
+  status            BroadcastStatus @default(draft)
+  totalRecipients   Int             @default(0) @map("total_recipients")
+  sentCount         Int             @default(0) @map("sent_count")
+  deliveredCount    Int             @default(0) @map("delivered_count")
+  readCount         Int             @default(0) @map("read_count")
+  repliedCount      Int             @default(0) @map("replied_count")
+  failedCount       Int             @default(0) @map("failed_count")
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account             Account              @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  broadcastRecipients BroadcastRecipient[]
+
+  @@index([accountId], map: "idx_broadcasts_account")
+  @@map("broadcasts")
+}
+
+model BroadcastRecipient {
+  id                String                   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  broadcastId       String                   @map("broadcast_id") @db.Uuid
+  contactId         String?                  @map("contact_id") @db.Uuid
+  status            BroadcastRecipientStatus @default(pending)
+  whatsappMessageId String?                  @map("whatsapp_message_id")
+  sentAt            DateTime?                @map("sent_at") @db.Timestamptz(6)
+  deliveredAt       DateTime?                @map("delivered_at") @db.Timestamptz(6)
+  readAt            DateTime?                @map("read_at") @db.Timestamptz(6)
+  repliedAt         DateTime?                @map("replied_at") @db.Timestamptz(6)
+  errorMessage      String?                  @map("error_message")
+  createdAt         DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  contact   Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([broadcastId], map: "idx_broadcast_recipients_broadcast")
+  @@index([broadcastId, status], map: "idx_broadcast_recipients_broadcast_status")
+  @@index([whatsappMessageId], map: "idx_broadcast_recipients_wamid")
+  /// Partial unique index: CREATE UNIQUE INDEX idx_broadcast_recipients_wamid ON broadcast_recipients (whatsapp_message_id) WHERE whatsapp_message_id IS NOT NULL
+  @@map("broadcast_recipients")
+}
+
+// ---------------------------------------------------------------------------
+// Automations
+// ---------------------------------------------------------------------------
+
+model Automation {
+  id              String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId          String    @map("user_id") @db.Uuid
+  accountId       String    @map("account_id") @db.Uuid
+  name            String
+  description     String?
+  triggerType     String    @map("trigger_type")
+  triggerConfig   Json      @default("{}") @map("trigger_config")
+  isActive        Boolean   @default(false) @map("is_active")
+  executionCount  Int       @default(0) @map("execution_count")
+  lastExecutedAt  DateTime? @map("last_executed_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account                     Account                      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  automationSteps             AutomationStep[]
+  automationLogs              AutomationLog[]
+  automationPendingExecutions AutomationPendingExecution[]
+
+  @@index([userId], map: "idx_automations_user_id")
+  @@index([triggerType], map: "idx_automations_active_trigger")
+  /// Partial index: WHERE is_active = TRUE
+  @@index([accountId], map: "idx_automations_account")
+  @@index([accountId, triggerType], map: "idx_automations_account_active_trigger")
+  /// Partial index: WHERE is_active = TRUE
+  @@map("automations")
+}
+
+model AutomationStep {
+  id           String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  automationId String            @map("automation_id") @db.Uuid
+  parentStepId String?           @map("parent_step_id") @db.Uuid
+  branch       AutomationBranch?
+  stepType     String            @map("step_type")
+  stepConfig   Json              @default("{}") @map("step_config")
+  position     Int
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  automation                  Automation                   @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  parentStep                  AutomationStep?              @relation("AutomationStepParent", fields: [parentStepId], references: [id], onDelete: Cascade)
+  childSteps                  AutomationStep[]             @relation("AutomationStepParent")
+  automationPendingExecutions AutomationPendingExecution[]
+
+  @@index([automationId, position], map: "idx_automation_steps_automation_id")
+  @@index([parentStepId], map: "idx_automation_steps_parent")
+  /// Partial index: WHERE parent_step_id IS NOT NULL
+  @@map("automation_steps")
+}
+
+model AutomationLog {
+  id             String              @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  automationId   String              @map("automation_id") @db.Uuid
+  userId         String              @map("user_id") @db.Uuid
+  accountId      String              @map("account_id") @db.Uuid
+  contactId      String?             @map("contact_id") @db.Uuid
+  triggerEvent   String              @map("trigger_event")
+  stepsExecuted  Json                @default("[]") @map("steps_executed")
+  status         AutomationLogStatus
+  errorMessage   String?             @map("error_message")
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  automation                  Automation                   @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  account                     Account                      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contact                     Contact?                     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  automationPendingExecutions AutomationPendingExecution[]
+
+  @@index([automationId, createdAt(sort: Desc)], map: "idx_automation_logs_automation")
+  @@index([userId], map: "idx_automation_logs_user")
+  @@index([accountId], map: "idx_automation_logs_account")
+  @@map("automation_logs")
+}
+
+model AutomationPendingExecution {
+  id               String                  @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  automationId     String                  @map("automation_id") @db.Uuid
+  userId           String                  @map("user_id") @db.Uuid
+  accountId        String                  @map("account_id") @db.Uuid
+  contactId        String?                 @map("contact_id") @db.Uuid
+  logId            String?                 @map("log_id") @db.Uuid
+  parentStepId     String?                 @map("parent_step_id") @db.Uuid
+  branch           AutomationBranch?
+  nextStepPosition Int                     @map("next_step_position")
+  context          Json                    @default("{}")
+  status           AutomationPendingStatus @default(pending)
+  runAt            DateTime                @map("run_at") @db.Timestamptz(6)
+  createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  automation Automation      @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  account    Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contact    Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  log        AutomationLog?  @relation(fields: [logId], references: [id], onDelete: Cascade)
+  parentStep AutomationStep? @relation(fields: [parentStepId], references: [id], onDelete: SetNull)
+
+  @@index([runAt], map: "idx_automation_pending_due")
+  /// Partial index: WHERE status = 'pending'
+  @@index([accountId], map: "idx_automation_pending_account")
+  @@map("automation_pending_executions")
+}
+
+// ---------------------------------------------------------------------------
+// Flows
+// ---------------------------------------------------------------------------
+
+model Flow {
+  id              String          @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId          String          @map("user_id") @db.Uuid
+  accountId       String          @map("account_id") @db.Uuid
+  name            String
+  description     String?
+  status          FlowStatus      @default(draft)
+  triggerType     FlowTriggerType @map("trigger_type")
+  triggerConfig   Json            @default("{}") @map("trigger_config")
+  entryNodeId     String?         @map("entry_node_id")
+  fallbackPolicy  Json            @default("{\"on_unknown_reply\":\"reprompt\",\"max_reprompts\":2,\"on_timeout_hours\":24,\"on_exhaust\":\"handoff\"}") @map("fallback_policy")
+  executionCount  Int             @default(0) @map("execution_count")
+  lastExecutedAt  DateTime?       @map("last_executed_at") @db.Timestamptz(6)
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account   Account    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  flowNodes FlowNode[]
+  flowRuns  FlowRun[]
+
+  @@index([userId, triggerType], map: "idx_flows_active_trigger")
+  /// Partial index: WHERE status = 'active'
+  @@index([accountId], map: "idx_flows_account")
+  @@index([accountId], map: "idx_flows_account_active")
+  /// Partial index: WHERE status = 'active'
+  @@map("flows")
+}
+
+model FlowNode {
+  id        String       @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  flowId    String       @map("flow_id") @db.Uuid
+  nodeKey   String       @map("node_key")
+  nodeType  FlowNodeType @map("node_type")
+  config    Json         @default("{}")
+  positionX Int          @default(0) @map("position_x")
+  positionY Int          @default(0) @map("position_y")
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  flow Flow @relation(fields: [flowId], references: [id], onDelete: Cascade)
+
+  @@unique([flowId, nodeKey])
+  @@index([flowId], map: "idx_flow_nodes_flow")
+  @@map("flow_nodes")
+}
+
+model FlowRun {
+  id                   String        @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  flowId               String        @map("flow_id") @db.Uuid
+  userId               String        @map("user_id") @db.Uuid
+  accountId            String        @map("account_id") @db.Uuid
+  contactId            String?       @map("contact_id") @db.Uuid
+  conversationId       String?       @map("conversation_id") @db.Uuid
+  status               FlowRunStatus @default(active)
+  currentNodeKey       String?       @map("current_node_key")
+  lastPromptMessageId  String?       @map("last_prompt_message_id") @db.Uuid
+  vars                 Json          @default("{}")
+  repromptCount        Int           @default(0) @map("reprompt_count")
+  startedAt            DateTime      @default(now()) @map("started_at") @db.Timestamptz(6)
+  lastAdvancedAt       DateTime      @default(now()) @map("last_advanced_at") @db.Timestamptz(6)
+  endedAt              DateTime?     @map("ended_at") @db.Timestamptz(6)
+  endReason            String?       @map("end_reason")
+
+  flow              Flow            @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  account           Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contact           Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  conversation      Conversation?   @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  lastPromptMessage Message?        @relation("FlowRunLastPrompt", fields: [lastPromptMessageId], references: [id], onDelete: SetNull)
+  flowRunEvents     FlowRunEvent[]
+
+  @@index([accountId, contactId], map: "idx_one_active_run_per_contact")
+  /// Partial unique index: CREATE UNIQUE INDEX idx_one_active_run_per_contact ON flow_runs (account_id, contact_id) WHERE status = 'active'
+  @@index([lastAdvancedAt], map: "idx_flow_runs_active_advanced")
+  /// Partial index: WHERE status = 'active'
+  @@index([flowId, startedAt(sort: Desc)], map: "idx_flow_runs_flow_started")
+  @@index([accountId], map: "idx_flow_runs_account")
+  @@map("flow_runs")
+}
+
+model FlowRunEvent {
+  id        String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  flowRunId String           @map("flow_run_id") @db.Uuid
+  eventType FlowRunEventType @map("event_type")
+  nodeKey   String?          @map("node_key")
+  payload   Json             @default("{}")
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  flowRun FlowRun @relation(fields: [flowRunId], references: [id], onDelete: Cascade)
+
+  @@index([flowRunId, eventType], map: "idx_flow_run_events_run_type")
+  @@index([flowRunId, createdAt(sort: Desc)], map: "idx_flow_run_events_run_time")
+  @@map("flow_run_events")
+}

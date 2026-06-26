@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
-import { createClient } from "@/lib/supabase/client";
+import { fetchJson } from "@/lib/api/fetch-json";
 import { useAuth } from "@/hooks/use-auth";
 import { CURRENCIES } from "@/lib/currency";
 import type {
@@ -52,7 +52,6 @@ export function DealForm({
   defaultStageId,
   onSaved,
 }: DealFormProps) {
-  const supabase = createClient();
   const { accountId, defaultCurrency } = useAuth();
 
   const [title, setTitle] = useState("");
@@ -111,17 +110,17 @@ export function DealForm({
     let cancelled = false;
     (async () => {
       const [c, p] = await Promise.all([
-        supabase.from("contacts").select("*").order("name"),
-        supabase.from("profiles").select("*").order("full_name"),
+        fetchJson<{ contacts: Contact[] }>('/api/data/contacts?page=0&page_size=100'),
+        fetchJson<{ profiles: Profile[] }>('/api/data/profiles'),
       ]);
       if (cancelled) return;
-      setContacts((c.data ?? []) as Contact[]);
-      setProfiles((p.data ?? []) as Profile[]);
+      setContacts(c.contacts ?? []);
+      setProfiles(p.profiles ?? []);
     })();
     return () => {
       cancelled = true;
     };
-  }, [open, supabase]);
+  }, [open]);
 
   // Fetch linked conversation for the selected contact (newest open one).
   // Clearing on no-selection is sync with prop state; the populated
@@ -134,20 +133,18 @@ export function DealForm({
     }
     let cancelled = false;
     (async () => {
-      const { data } = await supabase
-        .from("conversations")
-        .select("*")
-        .eq("contact_id", contactId)
-        .order("last_message_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const { conversations } = await fetchJson<{ conversations: Conversation[] }>(
+        '/api/data/conversations',
+      );
       if (cancelled) return;
-      setLinkedConversation((data as Conversation | null) ?? null);
+      const match =
+        (conversations ?? []).find((c) => c.contact_id === contactId) ?? null;
+      setLinkedConversation(match);
     })();
     return () => {
       cancelled = true;
     };
-  }, [open, contactId, supabase]);
+  }, [open, contactId]);
 
   async function handleSave() {
     if (!title.trim() || !contactId || !stageId) {
@@ -168,79 +165,66 @@ export function DealForm({
       expected_close_date: expectedCloseDate || null,
     };
 
-    if (deal) {
-      const { error } = await supabase
-        .from("deals")
-        .update(payload)
-        .eq("id", deal.id);
-      if (error) {
-        toast.error("Failed to save deal");
-        setSaving(false);
-        return;
+    try {
+      if (deal) {
+        await fetchJson(`/api/data/deals/${deal.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+      } else {
+        if (!accountId) {
+          toast.error('Your profile is not linked to an account.');
+          return;
+        }
+        await fetchJson('/api/data/deals', {
+          method: 'POST',
+          body: JSON.stringify({ ...payload, status: 'open' }),
+        });
       }
-    } else {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) {
-        toast.error("Not signed in");
-        setSaving(false);
-        return;
-      }
-      if (!accountId) {
-        toast.error("Your profile is not linked to an account.");
-        setSaving(false);
-        return;
-      }
-      const { error } = await supabase
-        .from("deals")
-        .insert({ ...payload, user_id: user.id, account_id: accountId, status: "open" });
-      if (error) {
-        toast.error("Failed to create deal");
-        setSaving(false);
-        return;
-      }
+      toast.success(deal ? 'Deal updated' : 'Deal created');
+      onOpenChange(false);
+      onSaved();
+    } catch {
+      toast.error(deal ? 'Failed to save deal' : 'Failed to create deal');
+    } finally {
+      setSaving(false);
     }
-
-    setSaving(false);
-    toast.success(deal ? "Deal updated" : "Deal created");
-    onOpenChange(false);
-    onSaved();
   }
 
   async function handleStatusChange(status: DealStatus) {
     if (!deal) return;
     setStatusAction(status);
-    const { error } = await supabase
-      .from("deals")
-      .update({ status })
-      .eq("id", deal.id);
-    setStatusAction(null);
-    if (error) {
-      toast.error("Failed to update deal status");
-      return;
+    try {
+      await fetchJson(`/api/data/deals/${deal.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      });
+      toast.success(
+        status === 'won' ? 'Marked as won' : status === 'lost' ? 'Marked as lost' : 'Deal reopened',
+      );
+      onOpenChange(false);
+      onSaved();
+    } catch {
+      toast.error('Failed to update deal status');
+    } finally {
+      setStatusAction(null);
     }
-    toast.success(
-      status === "won" ? "Marked as won" : status === "lost" ? "Marked as lost" : "Deal reopened",
-    );
-    onOpenChange(false);
-    onSaved();
   }
 
   async function handleDelete() {
     if (!deal) return;
     setDeleting(true);
-    const { error } = await supabase.from("deals").delete().eq("id", deal.id);
-    setDeleting(false);
-    if (error) {
-      toast.error("Failed to delete deal");
-      return;
+    try {
+      await fetchJson(`/api/data/deals/${deal.id}`, { method: 'DELETE' });
+      toast.success('Deal deleted');
+      setConfirmDelete(false);
+      onOpenChange(false);
+      onSaved();
+    } catch {
+      toast.error('Failed to delete deal');
+    } finally {
+      setDeleting(false);
     }
-    toast.success("Deal deleted");
-    setConfirmDelete(false);
-    onOpenChange(false);
-    onSaved();
   }
 
   return (

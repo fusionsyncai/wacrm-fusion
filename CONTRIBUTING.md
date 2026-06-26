@@ -21,13 +21,14 @@ opinions become yours.
 git clone https://github.com/<your-username>/wacrm.git
 cd wacrm
 
-cp .env.local.example .env.local   # fill in Supabase + Meta creds
+cp .env.local.example .env.local   # fill in DATABASE_URL, DIRECT_URL, Meta creds
 npm install
+npm run db:push
 npm run dev
 ```
 
-Full setup (Supabase migrations, WhatsApp Business API, deploy) lives in
-[`docs/`](./docs/README.md).
+Full setup (Prisma schema sync, WhatsApp Business API, deploy) lives in
+[`docs/`](./docs/README.md) and [`prisma/README.md`](./prisma/README.md).
 
 ## Keeping your fork up to date
 
@@ -116,6 +117,8 @@ in your fork:
 | `npm run lint` | ESLint. |
 | `npm run format` | Prettier write. |
 | `npm run format:check` | Prettier in check-only mode. Useful in CI. |
+| `npm run db:generate` | Regenerate Prisma Client from `prisma/schema.prisma`. |
+| `npm run db:push` | Sync schema to Postgres (`DIRECT_URL`). |
 
 ## Licensing
 

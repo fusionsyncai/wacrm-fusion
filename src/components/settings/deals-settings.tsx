@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Coins, Loader2 } from "lucide-react";
 
-import { createClient } from "@/lib/supabase/client";
+import { fetchJson } from "@/lib/api/fetch-json";
 import { useAuth } from "@/hooks/use-auth";
 import { CURRENCIES } from "@/lib/currency";
 import { Button } from "@/components/ui/button";
@@ -28,7 +28,6 @@ import { SettingsPanelHead } from "./settings-panel-head";
  * admins+, so non-admins see a disabled, read-only control.
  */
 export function DealsSettings() {
-  const supabase = createClient();
   const {
     accountId,
     defaultCurrency,
@@ -51,20 +50,18 @@ export function DealsSettings() {
   async function handleSave() {
     if (!accountId || !dirty) return;
     setSaving(true);
-    const { error } = await supabase
-      .from("accounts")
-      .update({ default_currency: selected })
-      .eq("id", accountId);
-    if (error) {
+    try {
+      await fetchJson("/api/account", {
+        method: "PATCH",
+        body: JSON.stringify({ default_currency: selected }),
+      });
+      await refreshProfile();
+      toast.success("Default currency updated");
+    } catch {
       toast.error("Failed to save default currency");
+    } finally {
       setSaving(false);
-      return;
     }
-    // Pull the new value back into the auth context so the deal form
-    // and every total pick it up without a full reload.
-    await refreshProfile();
-    setSaving(false);
-    toast.success("Default currency updated");
   }
 
   return (

@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { fetchJson } from '@/lib/api/fetch-json';
 import { useAuth } from '@/hooks/use-auth';
 import { toast } from 'sonner';
 import type { CustomField } from '@/types';
@@ -55,8 +55,7 @@ export function CustomFieldsManager({
  * `custom_fields` RLS also rejects non-admin writes as defense in depth.
  */
 export function CustomFieldsPanel() {
-  const supabase = createClient();
-  const { user, accountId } = useAuth();
+  const { accountId } = useAuth();
 
   const [fields, setFields] = useState<CustomField[]>([]);
   const [loading, setLoading] = useState(true);
@@ -67,13 +66,12 @@ export function CustomFieldsPanel() {
   const fetchFields = useCallback(async () => {
     if (!accountId) return;
     setLoading(true);
-    const { data } = await supabase
-      .from('custom_fields')
-      .select('*')
-      .order('field_name');
-    setFields((data as CustomField[] | null) ?? []);
+    const { custom_fields: data } = await fetchJson<{ custom_fields: CustomField[] }>(
+      '/api/data/custom-fields',
+    );
+    setFields(data ?? []);
     setLoading(false);
-  }, [supabase, accountId]);
+  }, [accountId]);
 
   // Load the field list on mount once the account is known. The setters
   // inside fetchFields run after the Supabase await — not synchronously in
@@ -96,7 +94,7 @@ export function CustomFieldsPanel() {
   async function handleCreate() {
     const name = newName.trim();
     if (!name) return;
-    if (!accountId || !user) {
+    if (!accountId) {
       toast.error('Your profile is not linked to an account.');
       return;
     }
@@ -106,21 +104,19 @@ export function CustomFieldsPanel() {
     }
 
     setCreating(true);
-    const { error } = await supabase.from('custom_fields').insert({
-      field_name: name,
-      field_type: 'text',
-      user_id: user.id,
-      account_id: accountId,
-    });
-    setCreating(false);
-
-    if (error) {
+    try {
+      await fetchJson('/api/data/custom-fields', {
+        method: 'POST',
+        body: JSON.stringify({ field_name: name, field_type: 'text' }),
+      });
+      toast.success(`Created "${name}".`);
+      setNewName('');
+      await fetchFields();
+    } catch {
       toast.error('Could not create field. You may not have permission.');
-      return;
+    } finally {
+      setCreating(false);
     }
-    toast.success(`Created "${name}".`);
-    setNewName('');
-    await fetchFields();
   }
 
   /** Returns true on success so the row can keep the new name, false so it
@@ -136,17 +132,19 @@ export function CustomFieldsPanel() {
       return false;
     }
     setBusyId(field.id);
-    const { error } = await supabase
-      .from('custom_fields')
-      .update({ field_name: name })
-      .eq('id', field.id);
-    setBusyId(null);
-    if (error) {
+    try {
+      await fetchJson(`/api/data/custom-fields/${field.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ field_name: name }),
+      });
+      await fetchFields();
+      return true;
+    } catch {
       toast.error('Could not rename field.');
       return false;
+    } finally {
+      setBusyId(null);
     }
-    await fetchFields();
-    return true;
   }
 
   async function handleDelete(field: CustomField) {
@@ -158,17 +156,15 @@ export function CustomFieldsPanel() {
       return;
     }
     setBusyId(field.id);
-    const { error } = await supabase
-      .from('custom_fields')
-      .delete()
-      .eq('id', field.id);
-    setBusyId(null);
-    if (error) {
+    try {
+      await fetchJson(`/api/data/custom-fields/${field.id}`, { method: 'DELETE' });
+      toast.success(`Deleted "${field.field_name}".`);
+      await fetchFields();
+    } catch {
       toast.error('Could not delete field.');
-      return;
+    } finally {
+      setBusyId(null);
     }
-    toast.success(`Deleted "${field.field_name}".`);
-    await fetchFields();
   }
 
   return (

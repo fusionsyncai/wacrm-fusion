@@ -25,6 +25,9 @@ interface MessageBubbleProps {
   reactions?: MessageReaction[];
   currentUserId?: string;
   onToggleReaction?: (emoji: string) => void;
+  onSendDraft?: (messageId: string) => void;
+  onDiscardDraft?: (messageId: string) => void;
+  canActOnDraft?: boolean;
 }
 
 function StatusIcon({ status }: { status: Message["status"] }) {
@@ -39,6 +42,8 @@ function StatusIcon({ status }: { status: Message["status"] }) {
       return <CheckCheck className="h-3 w-3 text-blue-400" />;
     case "failed":
       return <XCircle className="h-3 w-3 text-red-400" />;
+    case "draft":
+      return null;
     default:
       return null;
   }
@@ -247,8 +252,12 @@ export function MessageBubble({
   reactions,
   currentUserId,
   onToggleReaction,
+  onSendDraft,
+  onDiscardDraft,
+  canActOnDraft = false,
 }: MessageBubbleProps) {
   const isAgent = message.sender_type === "agent" || message.sender_type === "bot";
+  const isDraft = message.status === "draft";
   const time = format(new Date(message.created_at), "HH:mm");
 
   // Row alignment + width cap are owned by <MessageActions> so its hover
@@ -263,11 +272,21 @@ export function MessageBubble({
       <div
         className={cn(
           "relative rounded-2xl px-3 py-2",
-          isAgent
-            ? "rounded-br-md bg-primary text-primary-foreground"
-            : "rounded-bl-md bg-muted text-foreground",
+          isDraft &&
+            "rounded-br-md border border-dashed border-primary/50 bg-primary/10 text-foreground",
+          !isDraft &&
+            isAgent &&
+            "rounded-br-md bg-primary text-primary-foreground",
+          !isDraft &&
+            !isAgent &&
+            "rounded-bl-md bg-muted text-foreground",
         )}
       >
+        {isDraft && (
+          <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-primary">
+            AI draft
+          </p>
+        )}
         {reply && (
           <ReplyQuote
             authorLabel={reply.authorLabel}
@@ -294,8 +313,26 @@ export function MessageBubble({
           >
             {time}
           </span>
-          {isAgent && <StatusIcon status={message.status} />}
+          {isAgent && !isDraft && <StatusIcon status={message.status} />}
         </div>
+        {isDraft && canActOnDraft && (
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => onSendDraft?.(message.id)}
+              className="rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              Send
+            </button>
+            <button
+              type="button"
+              onClick={() => onDiscardDraft?.(message.id)}
+              className="rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-muted"
+            >
+              Discard
+            </button>
+          </div>
+        )}
       </div>
       {reactions && reactions.length > 0 && onToggleReaction && (
         <MessageReactions

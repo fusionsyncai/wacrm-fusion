@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
-import type { SupabaseClient } from '@supabase/supabase-js'
-import { createClient } from '@/lib/supabase/server'
+import type { Prisma } from '@/generated/prisma/client'
+import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account'
+import { serializeMessageTemplate } from '@/lib/db/api-serialize'
+import { prisma } from '@/lib/prisma'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { submitMessageTemplate } from '@/lib/whatsapp/meta-api'
 import {
@@ -57,19 +59,56 @@ function buildUpsertRow(
 }
 
 async function upsertTemplateRow(
-  supabase: SupabaseClient,
+  userId: string,
+  accountId: string,
   row: ReturnType<typeof buildUpsertRow>,
 ) {
-  // TODO(account-sharing): conflict target is still scoped to
-  // user_id. Once a follow-up migration drops the legacy unique
-  // index on (user_id, name, language) and adds (account_id,
-  // name, language), switch `onConflict` here so two teammates
-  // can't shadow each other's same-named template.
-  return supabase
-    .from('message_templates')
-    .upsert(row, { onConflict: 'user_id,name,language' })
-    .select()
-    .single()
+  const language = row.language ?? 'en_US'
+  return prisma.messageTemplate.upsert({
+    where: {
+      userId_name_language: {
+        userId,
+        name: row.name,
+        language,
+      },
+    },
+    create: {
+      userId,
+      accountId,
+      name: row.name,
+      category: row.category,
+      language,
+      headerType: row.header_type ?? null,
+      headerContent: row.header_content ?? null,
+      headerMediaUrl: row.header_media_url ?? null,
+      headerHandle: row.header_handle ?? null,
+      bodyText: row.body_text,
+      footerText: row.footer_text ?? null,
+      buttons: row.buttons ?? undefined,
+      sampleValues: (row.sample_values ?? undefined) as Prisma.InputJsonValue | undefined,
+      status: row.status as import('@/generated/prisma/client').MessageTemplateStatus,
+      metaTemplateId: row.meta_template_id,
+      submissionError: row.submission_error,
+      rejectionReason: null,
+      lastSubmittedAt: new Date(),
+    },
+    update: {
+      category: row.category,
+      headerType: row.header_type ?? null,
+      headerContent: row.header_content ?? null,
+      headerMediaUrl: row.header_media_url ?? null,
+      headerHandle: row.header_handle ?? null,
+      bodyText: row.body_text,
+      footerText: row.footer_text ?? null,
+      buttons: row.buttons ?? undefined,
+      sampleValues: (row.sample_values ?? undefined) as Prisma.InputJsonValue | undefined,
+      status: row.status as import('@/generated/prisma/client').MessageTemplateStatus,
+      metaTemplateId: row.meta_template_id,
+      submissionError: row.submission_error,
+      rejectionReason: null,
+      lastSubmittedAt: new Date(),
+    },
+  })
 }
 
 /**
@@ -88,29 +127,9 @@ async function upsertTemplateRow(
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    // Resolve the caller's account_id — whatsapp_config + the
-    // message_templates row are account-scoped post-multi-user.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
+    const ctx = await getCurrentAccount()
+    const accountId = ctx.accountId
+    const userId = ctx.userId
 
     let payload: TemplatePayload
     try {
@@ -149,12 +168,10 @@ export async function POST(request: Request) {
       metaTemplateId = `dry-run-${crypto.randomUUID()}`
       metaStatus = 'PENDING'
     } else {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config) {
+      const config = await prisma.whatsappConfig.findUnique({
+        where: { accountId },
+      })
+      if (!config) {
         return NextResponse.json(
           {
             error:
@@ -163,7 +180,7 @@ export async function POST(request: Request) {
           { status: 400 },
         )
       }
-      if (!config.waba_id) {
+      if (!config.wabaId) {
         return NextResponse.json(
           {
             error:
@@ -173,7 +190,7 @@ export async function POST(request: Request) {
         )
       }
 
-      const accessToken = decrypt(config.access_token)
+      const accessToken = decrypt(config.accessToken)
 
       // Image headers need a Resumable-Upload handle (Meta rejects a
       // plain URL at creation). Derive it from header_media_url before
@@ -191,7 +208,7 @@ export async function POST(request: Request) {
       const metaPayload = buildMetaTemplatePayload(payload)
       try {
         const meta = await submitMessageTemplate({
-          wabaId: config.waba_id,
+          wabaId: config.wabaId,
           accessToken,
           payload: metaPayload,
         })
@@ -202,8 +219,9 @@ export async function POST(request: Request) {
         // Persist the failure so the user can retry; row stays DRAFT
         // until they fix and re-submit.
         await upsertTemplateRow(
-          supabase,
-          buildUpsertRow(accountId, user.id, payload, {
+          userId,
+          accountId,
+          buildUpsertRow(accountId, userId, payload, {
             status: 'DRAFT',
             metaTemplateId: null,
             submissionError: message,
@@ -221,34 +239,28 @@ export async function POST(request: Request) {
       }
     }
 
-    const { data: row, error: upsertErr } = await upsertTemplateRow(
-      supabase,
-      buildUpsertRow(accountId, user.id, payload, {
+    const row = await upsertTemplateRow(
+      userId,
+      accountId,
+      buildUpsertRow(accountId, userId, payload, {
         status: normalizeStatus(metaStatus),
         metaTemplateId,
         submissionError: null,
       }),
     )
 
-    if (upsertErr) {
-      // The submit succeeded on Meta's side but we failed to persist
-      // locally. That's a data-drift state — surface the meta_template_id
-      // so the user can recover via "Sync from Meta".
-      return NextResponse.json(
-        {
-          error: `Submitted to Meta but failed to save locally: ${upsertErr.message}. Run "Sync from Meta" to recover.`,
-          meta_template_id: metaTemplateId,
-        },
-        { status: 500 },
-      )
-    }
-
     return NextResponse.json({
       success: true,
-      template: row,
+      template: serializeMessageTemplate(row),
       dry_run: dryRun,
     })
   } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === 'UnauthorizedError' || error.name === 'ForbiddenError')
+    ) {
+      return toErrorResponse(error)
+    }
     console.error('Error submitting template:', error)
     return NextResponse.json(
       {

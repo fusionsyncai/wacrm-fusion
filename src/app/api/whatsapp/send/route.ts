@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account'
+import { serializeMessageTemplate } from '@/lib/db/api-serialize'
+import { prisma } from '@/lib/prisma'
 import {
   sendTextMessage,
   sendTemplateMessage,
@@ -7,7 +9,6 @@ import {
   type MediaKind,
 } from '@/lib/whatsapp/meta-api'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
-import { supabaseAdmin } from '@/lib/flows/admin-client'
 import {
   sanitizePhoneForMeta,
   isValidE164,
@@ -24,42 +25,12 @@ import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
 
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
+    const ctx = await getCurrentAccount()
+    const accountId = ctx.accountId
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      )
-    }
-
-    // Per-user rate limit. Bucket key is scoped to this route so
-    // `/broadcast` has an independent budget.
-    const limit = checkRateLimit(`send:${user.id}`, RATE_LIMITS.send)
+    const limit = checkRateLimit(`send:${ctx.userId}`, RATE_LIMITS.send)
     if (!limit.success) {
       return rateLimitResponse(limit)
-    }
-
-    // Resolve the caller's account_id. Every downstream lookup
-    // (conversation, whatsapp_config, message_templates) is account-
-    // scoped post-multi-user, so the previous `user_id` filters
-    // returned nothing for teammates who didn't author the row.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
     }
 
     const body = await request.json()
@@ -74,11 +45,44 @@ export async function POST(request: Request) {
       template_params,
       template_message_params,
       reply_to_message_id,
+      draft_message_id,
     } = body
 
-    if (!conversation_id || !message_type) {
+    if (!conversation_id) {
       return NextResponse.json(
-        { error: 'conversation_id and message_type are required' },
+        { error: 'conversation_id is required' },
+        { status: 400 }
+      )
+    }
+
+    let effectiveMessageType = message_type
+    let effectiveContentText = content_text
+    let draftRow: { id: string; contentText: string | null } | null = null
+
+    if (draft_message_id) {
+      const draft = await prisma.message.findFirst({
+        where: {
+          id: draft_message_id,
+          conversationId: conversation_id,
+          status: 'draft',
+          senderType: 'bot',
+        },
+        select: { id: true, contentText: true },
+      })
+      if (!draft?.contentText) {
+        return NextResponse.json(
+          { error: 'Draft message not found or empty' },
+          { status: 404 }
+        )
+      }
+      draftRow = draft
+      effectiveMessageType = 'text'
+      effectiveContentText = draft.contentText
+    }
+
+    if (!effectiveMessageType && !draft_message_id) {
+      return NextResponse.json(
+        { error: 'message_type is required' },
         { status: 400 }
       )
     }
@@ -86,26 +90,28 @@ export async function POST(request: Request) {
     // Media kinds (image/video/document/audio) are sent to Meta via a
     // public URL the composer already uploaded to the chat-media bucket.
     const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const
-    const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(message_type)
+    const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(
+      effectiveMessageType,
+    )
 
     // Reject anything outside the known set up front rather than letting
     // an unknown type fall through to the text path with empty content.
     const VALID_MESSAGE_TYPES = ['text', 'template', ...MEDIA_KINDS] as const
-    if (!(VALID_MESSAGE_TYPES as readonly string[]).includes(message_type)) {
+    if (!(VALID_MESSAGE_TYPES as readonly string[]).includes(effectiveMessageType)) {
       return NextResponse.json(
-        { error: `Unsupported message_type "${message_type}"` },
+        { error: `Unsupported message_type "${effectiveMessageType}"` },
         { status: 400 }
       )
     }
 
-    if (message_type === 'text' && !content_text) {
+    if (effectiveMessageType === 'text' && !effectiveContentText) {
       return NextResponse.json(
         { error: 'content_text is required for text messages' },
         { status: 400 }
       )
     }
 
-    if (message_type === 'template' && !template_name) {
+    if (effectiveMessageType === 'template' && !template_name) {
       return NextResponse.json(
         { error: 'template_name is required for template messages' },
         { status: 400 }
@@ -114,7 +120,7 @@ export async function POST(request: Request) {
 
     if (isMediaKind && !media_url) {
       return NextResponse.json(
-        { error: `media_url is required for ${message_type} messages` },
+        { error: `media_url is required for ${effectiveMessageType} messages` },
         { status: 400 }
       )
     }
@@ -123,9 +129,9 @@ export async function POST(request: Request) {
     // wasted at the Meta call. (Audio carries no caption — see meta-api.)
     if (
       isMediaKind &&
-      message_type !== 'audio' &&
-      typeof content_text === 'string' &&
-      content_text.length > 1024
+      effectiveMessageType !== 'audio' &&
+      typeof effectiveContentText === 'string' &&
+      effectiveContentText.length > 1024
     ) {
       return NextResponse.json(
         { error: 'Caption exceeds the 1024-character limit' },
@@ -133,15 +139,12 @@ export async function POST(request: Request) {
       )
     }
 
-    // Fetch conversation and contact
-    const { data: conversation, error: convError } = await supabase
-      .from('conversations')
-      .select('*, contact:contacts(*)')
-      .eq('id', conversation_id)
-      .eq('account_id', accountId)
-      .single()
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversation_id, accountId },
+      include: { contact: true },
+    })
 
-    if (convError || !conversation) {
+    if (!conversation) {
       return NextResponse.json(
         { error: 'Conversation not found' },
         { status: 404 }
@@ -165,39 +168,30 @@ export async function POST(request: Request) {
       )
     }
 
-    // Fetch and decrypt WhatsApp config
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    const config = await prisma.whatsappConfig.findUnique({
+      where: { accountId },
+    })
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         { error: 'WhatsApp not configured. Please set up your WhatsApp integration first.' },
         { status: 400 }
       )
     }
 
-    const accessToken = decrypt(config.access_token)
+    const accessToken = decrypt(config.accessToken)
 
-    // Self-heal legacy CBC-encrypted tokens. Fire-and-forget: we
-    // return from the send without waiting, so a failed upgrade just
-    // means the next send tries again. The upgrade is idempotent —
-    // concurrent sends both produce valid GCM ciphertexts of the same
-    // plaintext, last write wins.
-    if (isLegacyFormat(config.access_token)) {
-      void supabase
-        .from('whatsapp_config')
-        .update({ access_token: encrypt(accessToken) })
-        .eq('id', config.id)
-        .then(({ error }) => {
-          if (error) {
-            console.warn(
-              '[whatsapp/send] access_token GCM upgrade failed:',
-              error.message,
-            )
-          }
+    if (isLegacyFormat(config.accessToken)) {
+      void prisma.whatsappConfig
+        .update({
+          where: { id: config.id },
+          data: { accessToken: encrypt(accessToken) },
+        })
+        .catch((err) => {
+          console.warn(
+            '[whatsapp/send] access_token GCM upgrade failed:',
+            err instanceof Error ? err.message : err,
+          )
         })
     }
 
@@ -207,20 +201,21 @@ export async function POST(request: Request) {
     // could quote messages they can't see by guessing UUIDs.
     let contextMessageId: string | undefined
     if (reply_to_message_id) {
-      const { data: parent, error: parentError } = await supabase
-        .from('messages')
-        .select('message_id, conversation_id')
-        .eq('id', reply_to_message_id)
-        .eq('conversation_id', conversation_id)
-        .maybeSingle()
+      const parent = await prisma.message.findFirst({
+        where: {
+          id: reply_to_message_id,
+          conversationId: conversation_id,
+        },
+        select: { messageId: true },
+      })
 
-      if (parentError || !parent) {
+      if (!parent) {
         return NextResponse.json(
           { error: 'reply_to_message_id not found in this conversation' },
           { status: 400 }
         )
       }
-      if (!parent.message_id) {
+      if (!parent.messageId) {
         // Parent never reached Meta (still in 'sending' or 'failed') — we
         // can't quote it on WhatsApp. Send without context rather than
         // dropping the message entirely.
@@ -228,7 +223,7 @@ export async function POST(request: Request) {
           '[whatsapp/send] reply target has no Meta message_id; sending without context'
         )
       } else {
-        contextMessageId = parent.message_id
+        contextMessageId = parent.messageId
       }
     }
 
@@ -251,14 +246,15 @@ export async function POST(request: Request) {
     // guards against a malformed row (e.g. from a partial sync)
     // crashing the send-builder later in the stack.
     let templateRow: MessageTemplate | null = null
-    if (message_type === 'template' && template_name) {
-      const { data } = await supabase
-        .from('message_templates')
-        .select('*')
-        .eq('account_id', accountId)
-        .eq('name', template_name)
-        .eq('language', template_language || 'en_US')
-        .maybeSingle()
+    if (effectiveMessageType === 'template' && template_name) {
+      const raw = await prisma.messageTemplate.findFirst({
+        where: {
+          accountId,
+          name: template_name,
+          language: template_language || 'en_US',
+        },
+      })
+      const data = raw ? serializeMessageTemplate(raw) : null
       if (data && !isMessageTemplate(data)) {
         return NextResponse.json(
           {
@@ -272,9 +268,9 @@ export async function POST(request: Request) {
     }
 
     const attempt = async (phone: string): Promise<string> => {
-      if (message_type === 'template') {
+      if (effectiveMessageType === 'template') {
         const result = await sendTemplateMessage({
-          phoneNumberId: config.phone_number_id,
+          phoneNumberId: config.phoneNumberId,
           accessToken,
           to: phone,
           templateName: template_name,
@@ -293,22 +289,22 @@ export async function POST(request: Request) {
         // sendMediaMessage). filename surfaces in the recipient's chat
         // for documents only.
         const result = await sendMediaMessage({
-          phoneNumberId: config.phone_number_id,
+          phoneNumberId: config.phoneNumberId,
           accessToken,
           to: phone,
-          kind: message_type as MediaKind,
+          kind: effectiveMessageType as MediaKind,
           link: media_url,
-          caption: content_text || undefined,
+          caption: effectiveContentText || undefined,
           filename: filename || undefined,
           contextMessageId,
         })
         return result.messageId
       }
       const result = await sendTextMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
-        text: content_text,
+        text: effectiveContentText,
         contextMessageId,
       })
       return result.messageId
@@ -354,49 +350,52 @@ export async function POST(request: Request) {
       console.log(
         `[whatsapp/send] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
       )
-      await supabase
-        .from('contacts')
-        .update({ phone: workingPhone })
-        .eq('id', contact.id)
+      await prisma.contact.update({
+        where: { id: contact.id },
+        data: { phone: workingPhone },
+      })
     }
 
     // Insert message into DB — field names MUST match the messages schema
     // (see supabase/migrations/001_initial_schema.sql):
     //   conversation_id, sender_type, content_type, content_text,
     //   media_url, template_name, message_id, status, created_at
-    const { data: messageRecord, error: msgError } = await supabase
-      .from('messages')
-      .insert({
-        conversation_id,
-        sender_type: 'agent',
-        content_type: message_type,
-        content_text: content_text || null,
-        media_url: media_url || null,
-        template_name: template_name || null,
-        message_id: waMessageId,
-        status: 'sent',
-        reply_to_message_id: reply_to_message_id || null,
-      })
-      .select()
-      .single()
+    const messageRecord = draftRow
+      ? await prisma.message.update({
+          where: { id: draftRow.id },
+          data: {
+            senderType: 'bot',
+            contentType: effectiveMessageType,
+            contentText: effectiveContentText || null,
+            mediaUrl: media_url || null,
+            templateName: template_name || null,
+            messageId: waMessageId,
+            status: 'sent',
+            replyToMessageId: reply_to_message_id || null,
+          },
+        })
+      : await prisma.message.create({
+          data: {
+            conversationId: conversation_id,
+            senderType: 'agent',
+            contentType: effectiveMessageType,
+            contentText: effectiveContentText || null,
+            mediaUrl: media_url || null,
+            templateName: template_name || null,
+            messageId: waMessageId,
+            status: 'sent',
+            replyToMessageId: reply_to_message_id || null,
+          },
+        })
 
-    if (msgError) {
-      console.error('Error inserting sent message:', msgError)
-      return NextResponse.json(
-        { error: `Message sent to Meta but failed to save to DB: ${msgError.message}` },
-        { status: 500 }
-      )
-    }
-
-    // Update conversation
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_text: content_text || `[${message_type}]`,
-        last_message_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', conversation_id)
+    await prisma.conversation.update({
+      where: { id: conversation_id },
+      data: {
+        lastMessageText:
+          effectiveContentText || `[${effectiveMessageType}]`,
+        lastMessageAt: new Date(),
+      },
+    })
 
     // Pause any active Flow run for this contact — the agent stepping
     // in is the strongest "yield, human is here" signal. See PR #2
@@ -405,23 +404,18 @@ export async function POST(request: Request) {
     // run later. For accounts with no active runs the UPDATE matches
     // zero rows — cheap and harmless.
     try {
-      const { error: pauseErr } = await supabaseAdmin()
-        .from('flow_runs')
-        .update({
+      await prisma.flowRun.updateMany({
+        where: {
+          accountId,
+          contactId: contact.id,
+          status: 'active',
+        },
+        data: {
           status: 'paused_by_agent',
-          ended_at: new Date().toISOString(),
-          end_reason: 'agent_replied',
-        })
-        .eq('account_id', accountId)
-        .eq('contact_id', contact.id)
-        .eq('status', 'active')
-      if (pauseErr) {
-        // Best-effort — log + continue. The agent's message already
-        // landed at Meta; don't fail the response over a bookkeeping
-        // miss. Worst case: a stale active run gets caught by the
-        // stale-run cron sweep within 24h.
-        console.error('[flows] pause-on-agent-send failed:', pauseErr.message)
-      }
+          endedAt: new Date(),
+          endReason: 'agent_replied',
+        },
+      })
     } catch (err) {
       console.error(
         '[flows] pause-on-agent-send threw:',
@@ -435,6 +429,12 @@ export async function POST(request: Request) {
       whatsapp_message_id: waMessageId,
     })
   } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === 'UnauthorizedError' || error.name === 'ForbiddenError')
+    ) {
+      return toErrorResponse(error)
+    }
     console.error('Error in WhatsApp send POST:', error)
     return NextResponse.json(
       { error: 'Failed to send message' },

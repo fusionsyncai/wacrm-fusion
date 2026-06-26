@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { fetchJson } from '@/lib/api/fetch-json';
 import { CustomField, Tag } from '@/types';
 import { Button } from '@/components/ui/button';
 import {
@@ -96,8 +96,7 @@ export function Step2SelectAudience({
     async function fetchTags() {
       setLoadingTags(true);
       try {
-        const supabase = createClient();
-        const { data } = await supabase.from('tags').select('*').order('name');
+        const { tags: data } = await fetchJson<{ tags: Tag[] }>('/api/data/tags');
         setTags(data ?? []);
       } finally {
         setLoadingTags(false);
@@ -112,11 +111,9 @@ export function Step2SelectAudience({
     async function fetchFields() {
       setLoadingFields(true);
       try {
-        const supabase = createClient();
-        const { data } = await supabase
-          .from('custom_fields')
-          .select('*')
-          .order('field_name');
+        const { custom_fields: data } = await fetchJson<{ custom_fields: CustomField[] }>(
+          '/api/data/custom-fields',
+        );
         setCustomFields(data ?? []);
       } finally {
         setLoadingFields(false);
@@ -128,10 +125,7 @@ export function Step2SelectAudience({
   const fetchEstimatedCount = useCallback(async () => {
     setLoadingCount(true);
     try {
-      const supabase = createClient();
-
-      // Base query — produces the superset before exclude is applied.
-      let baseIds: Set<string> | null = null; // null means "all contacts"
+      let baseIds: Set<string> | null = null;
 
       if (audience.type === 'all') {
         // Handled below — full-table count adjusted by excludes.
@@ -140,10 +134,9 @@ export function Step2SelectAudience({
         audience.tagIds &&
         audience.tagIds.length > 0
       ) {
-        const { data } = await supabase
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', audience.tagIds);
+        const { contact_tags: data } = await fetchJson<{
+          contact_tags: Array<{ contact_id: string }>;
+        }>(`/api/data/contact-tags?tag_ids=${audience.tagIds.join(',')}`);
         baseIds = new Set((data ?? []).map((r) => r.contact_id));
       } else if (
         audience.type === 'custom_field' &&
@@ -151,14 +144,14 @@ export function Step2SelectAudience({
         audience.customField.value
       ) {
         const { fieldId, operator, value } = audience.customField;
-        let q = supabase
-          .from('contact_custom_values')
-          .select('contact_id')
-          .eq('custom_field_id', fieldId);
-        if (operator === 'is') q = q.eq('value', value);
-        else if (operator === 'is_not') q = q.neq('value', value);
-        else q = q.ilike('value', `%${value}%`);
-        const { data } = await q;
+        const params = new URLSearchParams({
+          custom_field_id: fieldId,
+          operator,
+          value,
+        });
+        const { values: data } = await fetchJson<{
+          values: Array<{ contact_id: string }>;
+        }>(`/api/data/contact-custom-values?${params}`);
         baseIds = new Set((data ?? []).map((r) => r.contact_id));
       } else if (
         audience.type === 'csv' &&
@@ -168,33 +161,28 @@ export function Step2SelectAudience({
         setEstimatedCount(audience.csvContacts.length);
         return;
       } else {
-        // Partially-configured audience — wait for the user to finish.
         setEstimatedCount(null);
         return;
       }
 
-      // Apply exclude tags
       let excludeSet: Set<string> | null = null;
       if (audience.excludeTagIds && audience.excludeTagIds.length > 0) {
-        const { data: excludeRows } = await supabase
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', audience.excludeTagIds);
+        const { contact_tags: excludeRows } = await fetchJson<{
+          contact_tags: Array<{ contact_id: string }>;
+        }>(`/api/data/contact-tags?tag_ids=${audience.excludeTagIds.join(',')}`);
         excludeSet = new Set((excludeRows ?? []).map((r) => r.contact_id));
       }
 
       if (baseIds) {
-        const effective = [...baseIds].filter(
-          (id) => !excludeSet?.has(id),
-        );
+        const effective = [...baseIds].filter((id) => !excludeSet?.has(id));
         setEstimatedCount(effective.length);
       } else {
-        // "All" — fetch the total, then subtract exclude set if any.
-        const { count } = await supabase
-          .from('contacts')
-          .select('*', { count: 'exact', head: true });
-        const total = count ?? 0;
-        setEstimatedCount(excludeSet ? Math.max(0, total - excludeSet.size) : total);
+        const { total_count: total } = await fetchJson<{ total_count: number }>(
+          '/api/data/contacts?page=0&page_size=1',
+        );
+        setEstimatedCount(
+          excludeSet ? Math.max(0, (total ?? 0) - excludeSet.size) : (total ?? 0),
+        );
       }
     } finally {
       setLoadingCount(false);

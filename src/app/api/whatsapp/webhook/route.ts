@@ -1,29 +1,19 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { prisma } from '@/lib/prisma'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
-import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
+import { findExistingContact } from '@/lib/contacts/dedupe.server'
+import { isUniqueViolation } from '@/lib/contacts/dedupe'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
+import { safeRequestUrl } from '@/lib/http/forwarded'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
-
-// Lazy-initialized to avoid build-time crash when env vars are missing
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _adminClient: any = null
-function supabaseAdmin() {
-  if (!_adminClient) {
-    _adminClient = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!
-    )
-  }
-  return _adminClient
-}
+import { runAgentForInbound } from '@/lib/agents/engine'
 
 interface WhatsAppMessage {
   id: string
@@ -81,7 +71,7 @@ interface WhatsAppWebhookEntry {
 // GET - Webhook verification
 export async function GET(request: Request) {
   try {
-    const { searchParams } = new URL(request.url)
+    const { searchParams } = safeRequestUrl(request)
     const mode = searchParams.get('hub.mode')
     const challenge = searchParams.get('hub.challenge')
     const verifyToken = searchParams.get('hub.verify_token')
@@ -94,27 +84,23 @@ export async function GET(request: Request) {
     }
 
     // Fetch all whatsapp configs to check verify tokens
-    const { data: configs, error: configError } = await supabaseAdmin()
-      .from('whatsapp_config')
-      .select('id, verify_token')
+    const configs = await prisma.whatsappConfig.findMany({
+      select: { id: true, verifyToken: true },
+    })
 
-    if (configError || !configs) {
-      console.error('Error fetching configs for verification:', configError)
+    if (configs.length === 0) {
+      console.error('Error fetching configs for verification: no rows')
       return NextResponse.json(
         { error: 'Verification failed' },
         { status: 403 }
       )
     }
 
-    // Check if any config's verify_token matches. Also collect the
-    // matching row so we can opportunistically upgrade its token to
-    // GCM if it was still in the legacy CBC format.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let matchedConfig: any = null
+    let matchedConfig: { id: string; verifyToken: string | null } | null = null
     for (const config of configs) {
-      if (!config.verify_token) continue
+      if (!config.verifyToken) continue
       try {
-        if (decrypt(config.verify_token) === verifyToken) {
+        if (decrypt(config.verifyToken) === verifyToken) {
           matchedConfig = config
           break
         }
@@ -124,20 +110,17 @@ export async function GET(request: Request) {
     }
 
     if (matchedConfig) {
-      // Fire-and-forget GCM upgrade. Safe to run on every subscribe
-      // since it's a no-op once the column is already GCM.
-      if (isLegacyFormat(matchedConfig.verify_token)) {
-        void supabaseAdmin()
-          .from('whatsapp_config')
-          .update({ verify_token: encrypt(verifyToken) })
-          .eq('id', matchedConfig.id)
-          .then(({ error }: { error: unknown }) => {
-            if (error) {
-              console.warn(
-                '[webhook] verify_token GCM upgrade failed:',
-                (error as { message?: string })?.message ?? error,
-              )
-            }
+      if (isLegacyFormat(matchedConfig.verifyToken!)) {
+        void prisma.whatsappConfig
+          .update({
+            where: { id: matchedConfig.id },
+            data: { verifyToken: encrypt(verifyToken) },
+          })
+          .catch((err) => {
+            console.warn(
+              '[webhook] verify_token GCM upgrade failed:',
+              err instanceof Error ? err.message : err,
+            )
           })
       }
       // Return challenge as plain text
@@ -203,7 +186,6 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       if (isTemplateWebhookField(change.field)) {
         await handleTemplateWebhookChange(
           { field: change.field, value: change.value as unknown },
-          supabaseAdmin(),
         )
         continue
       }
@@ -227,21 +209,11 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       // operators see the real cause in logs. ≥2 rows shouldn't happen
       // post-migration 013 (UNIQUE constraint), but a row created
       // before the constraint, or a race, would still surface here.
-      const { data: configRows, error: configError } = await supabaseAdmin()
-        .from('whatsapp_config')
-        .select('*')
-        .eq('phone_number_id', phoneNumberId)
+      const configRows = await prisma.whatsappConfig.findMany({
+        where: { phoneNumberId: phoneNumberId },
+      })
 
-      if (configError) {
-        console.error(
-          'Error fetching whatsapp_config for phone_number_id:',
-          phoneNumberId,
-          configError
-        )
-        continue
-      }
-
-      if (!configRows || configRows.length === 0) {
+      if (configRows.length === 0) {
         console.error('No config found for phone_number_id:', phoneNumberId)
         continue
       }
@@ -252,14 +224,14 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           phoneNumberId,
           '— inbound message dropped. Resolve duplicates so each number maps to a single account.',
           'Account owners:',
-          configRows.map((r: { account_id: string; user_id: string }) => `${r.account_id} (admin ${r.user_id})`)
+          configRows.map((r) => `${r.accountId} (admin ${r.userId})`)
         )
         continue
       }
 
       const config = configRows[0]
 
-      const decryptedAccessToken = decrypt(config.access_token)
+      const decryptedAccessToken = decrypt(config.accessToken)
 
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
@@ -270,11 +242,11 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           contact,
           // Tenancy — drives every contact / conversation lookup
           // and the engines' active-row dispatch.
-          config.account_id,
+          config.accountId,
           // Audit / sender-of-record — used as the user_id on row
           // inserts that need it for NOT NULL FK compliance. Always
           // the admin who saved the WhatsApp config.
-          config.user_id,
+          config.userId,
           decryptedAccessToken
         )
       }
@@ -332,48 +304,42 @@ async function handleStatusUpdate(status: {
 }) {
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
   //    already match the CHECK constraint on messages.status.
-  const { error: msgErr } = await supabaseAdmin()
-    .from('messages')
-    .update({ status: status.status })
-    .eq('message_id', status.id)
-
-  if (msgErr) {
+  try {
+    await prisma.message.updateMany({
+      where: { messageId: status.id },
+      data: { status: status.status as 'sending' | 'sent' | 'delivered' | 'read' | 'failed' },
+    })
+  } catch (msgErr) {
     console.error('Error updating message status:', msgErr)
   }
 
-  // 2) Mirror onto broadcast_recipients via whatsapp_message_id
-  //    (added in migration 003). The aggregate trigger on
-  //    broadcast_recipients re-derives the parent broadcast's
-  //    sent/delivered/read/failed counts automatically.
-  const tsIso = new Date(parseInt(status.timestamp) * 1000).toISOString()
+  const tsIso = new Date(parseInt(status.timestamp) * 1000)
 
-  const { data: recipient, error: recFetchErr } = await supabaseAdmin()
-    .from('broadcast_recipients')
-    .select('id, status')
-    .eq('whatsapp_message_id', status.id)
-    .maybeSingle()
+  const recipient = await prisma.broadcastRecipient.findFirst({
+    where: { whatsappMessageId: status.id },
+    select: { id: true, status: true },
+  })
 
-  if (recFetchErr) {
-    console.error('Error fetching broadcast recipient:', recFetchErr)
-    return
-  }
-  if (!recipient) return // message wasn't part of a broadcast — fine
+  if (!recipient) return
 
-  // Guard transitions — forward-only on the success ladder, and
-  // `failed` only from pre-delivered states.
   if (!isValidStatusTransition(recipient.status, status.status)) return
 
-  const update: Record<string, unknown> = { status: status.status }
-  if (status.status === 'sent' && !('sent_at' in update)) update.sent_at = tsIso
-  if (status.status === 'delivered') update.delivered_at = tsIso
-  if (status.status === 'read') update.read_at = tsIso
+  const update: {
+    status: typeof recipient.status
+    sentAt?: Date
+    deliveredAt?: Date
+    readAt?: Date
+  } = { status: status.status as typeof recipient.status }
+  if (status.status === 'sent') update.sentAt = tsIso
+  if (status.status === 'delivered') update.deliveredAt = tsIso
+  if (status.status === 'read') update.readAt = tsIso
 
-  const { error: recUpdateErr } = await supabaseAdmin()
-    .from('broadcast_recipients')
-    .update(update)
-    .eq('id', recipient.id)
-
-  if (recUpdateErr) {
+  try {
+    await prisma.broadcastRecipient.update({
+      where: { id: recipient.id },
+      data: update,
+    })
+  } catch (recUpdateErr) {
     console.error('Error updating broadcast recipient status:', recUpdateErr)
   }
 }
@@ -392,26 +358,22 @@ async function flagBroadcastReplyIfAny(accountId: string, contactId: string) {
     // been replied to yet. Account-scoped so a shared inbox reply
     // marks the broadcast as replied regardless of which teammate
     // sent it.
-    const { data: recs, error } = await supabaseAdmin()
-      .from('broadcast_recipients')
-      .select('id, status, broadcast_id, broadcasts!inner(account_id)')
-      .eq('contact_id', contactId)
-      .eq('broadcasts.account_id', accountId)
-      .in('status', ['sent', 'delivered', 'read'])
-      .order('created_at', { ascending: false })
-      .limit(1)
+    const rec = await prisma.broadcastRecipient.findFirst({
+      where: {
+        contactId,
+        status: { in: ['sent', 'delivered', 'read'] },
+        broadcast: { accountId },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    })
 
-    if (error || !recs || recs.length === 0) return
+    if (!rec) return
 
-    const row = recs[0]
-    const { error: updErr } = await supabaseAdmin()
-      .from('broadcast_recipients')
-      .update({ status: 'replied', replied_at: new Date().toISOString() })
-      .eq('id', row.id)
-
-    if (updErr) {
-      console.error('Error marking broadcast recipient replied:', updErr)
-    }
+    await prisma.broadcastRecipient.update({
+      where: { id: rec.id },
+      data: { status: 'replied', repliedAt: new Date() },
+    })
   } catch (err) {
     console.error('flagBroadcastReplyIfAny failed:', err)
   }
@@ -426,16 +388,10 @@ async function lookupInternalIdByMetaId(
   metaId: string,
   conversationId: string
 ): Promise<string | null> {
-  const { data, error } = await supabaseAdmin()
-    .from('messages')
-    .select('id')
-    .eq('message_id', metaId)
-    .eq('conversation_id', conversationId)
-    .maybeSingle()
-  if (error) {
-    console.error('[webhook] lookupInternalIdByMetaId failed:', error.message)
-    return null
-  }
+  const data = await prisma.message.findFirst({
+    where: { messageId: metaId, conversationId },
+    select: { id: true },
+  })
   return data?.id ?? null
 }
 
@@ -469,32 +425,46 @@ async function handleReaction(
 
   // Empty emoji = removal (per Meta's Cloud API spec).
   if (!reaction.emoji) {
-    const { error: delError } = await supabaseAdmin()
-      .from('message_reactions')
-      .delete()
-      .eq('message_id', targetInternalId)
-      .eq('actor_type', 'customer')
-      .eq('actor_id', contactId)
-    if (delError) {
-      console.error('[webhook] reaction delete failed:', delError.message)
+    try {
+      await prisma.messageReaction.deleteMany({
+        where: {
+          messageId: targetInternalId,
+          actorType: 'customer',
+          actorId: contactId,
+        },
+      })
+    } catch (delError) {
+      console.error(
+        '[webhook] reaction delete failed:',
+        delError instanceof Error ? delError.message : delError,
+      )
     }
     return
   }
 
-  const { error: upsertError } = await supabaseAdmin()
-    .from('message_reactions')
-    .upsert(
-      {
-        message_id: targetInternalId,
-        conversation_id: conversationId,
-        actor_type: 'customer',
-        actor_id: contactId,
+  try {
+    await prisma.messageReaction.upsert({
+      where: {
+        messageId_actorType_actorId: {
+          messageId: targetInternalId,
+          actorType: 'customer',
+          actorId: contactId,
+        },
+      },
+      create: {
+        messageId: targetInternalId,
+        conversationId,
+        actorType: 'customer',
+        actorId: contactId,
         emoji: reaction.emoji,
       },
-      { onConflict: 'message_id,actor_type,actor_id' }
+      update: { emoji: reaction.emoji },
+    })
+  } catch (upsertError) {
+    console.error(
+      '[webhook] reaction upsert failed:',
+      upsertError instanceof Error ? upsertError.message : upsertError,
     )
-  if (upsertError) {
-    console.error('[webhook] reaction upsert failed:', upsertError.message)
   }
 }
 
@@ -588,46 +558,44 @@ async function processMessage(
   // BEFORE we insert, so the count is accurate. Covers the case where
   // the contact row already exists (manual add / CSV import) but they've
   // never messaged us before — which new_contact_created wouldn't catch.
-  const { count: priorCustomerMsgCount } = await supabaseAdmin()
-    .from('messages')
-    .select('id', { count: 'exact', head: true })
-    .eq('conversation_id', conversation.id)
-    .eq('sender_type', 'customer')
-  const isFirstInboundMessage = (priorCustomerMsgCount ?? 0) === 0
-
-  const { error: msgError } = await supabaseAdmin().from('messages').insert({
-    conversation_id: conversation.id,
-    sender_type: 'customer',
-    content_type: contentType,
-    content_text: contentText,
-    media_url: mediaUrl,
-    message_id: message.id,
-    status: 'delivered',
-    created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
-    reply_to_message_id: replyToInternalId,
-    // Only populated for content_type='interactive'. Migration 010 added
-    // the column; null for every other content_type so existing inserts
-    // behave identically.
-    interactive_reply_id: interactiveReplyId,
+  const priorCustomerMsgCount = await prisma.message.count({
+    where: {
+      conversationId: conversation.id,
+      senderType: 'customer',
+    },
   })
+  const isFirstInboundMessage = priorCustomerMsgCount === 0
 
-  if (msgError) {
+  try {
+    await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        senderType: 'customer',
+        contentType: contentType as 'text' | 'image' | 'document' | 'audio' | 'video' | 'location' | 'template' | 'interactive',
+        contentText: contentText,
+        mediaUrl: mediaUrl,
+        messageId: message.id,
+        status: 'delivered',
+        createdAt: new Date(parseInt(message.timestamp) * 1000),
+        replyToMessageId: replyToInternalId,
+        interactiveReplyId: interactiveReplyId,
+      },
+    })
+  } catch (msgError) {
     console.error('Error inserting message:', msgError)
     return
   }
 
-  // Update conversation
-  const { error: convError } = await supabaseAdmin()
-    .from('conversations')
-    .update({
-      last_message_text: contentText || `[${message.type}]`,
-      last_message_at: new Date().toISOString(),
-      unread_count: (conversation.unread_count || 0) + 1,
-      updated_at: new Date().toISOString(),
+  try {
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: {
+        lastMessageText: contentText || `[${message.type}]`,
+        lastMessageAt: new Date(),
+        unreadCount: (conversation.unreadCount || 0) + 1,
+      },
     })
-    .eq('id', conversation.id)
-
-  if (convError) {
+  } catch (convError) {
     console.error('Error updating conversation:', convError)
   }
 
@@ -676,6 +644,19 @@ async function processMessage(
     isFirstInboundMessage,
   })
   const flowConsumed = flowResult.consumed
+
+  // AI agent — text-only; skipped when a flow consumed the message.
+  // TODO: support image and voice note inbound for agent context
+  if (message.type === 'text') {
+    runAgentForInbound({
+      accountId,
+      userId: configOwnerUserId,
+      conversationId: conversation.id,
+      contactId: contactRecord.id,
+      inboundText: contentText ?? message.text?.body ?? '',
+      flowConsumed,
+    }).catch((err) => console.error('[agents] dispatch failed:', err))
+  }
 
   // Fire any automations that react to this webhook event. All dispatches
   // run here (not earlier) so the contact, conversation, and inbound
@@ -876,58 +857,36 @@ async function findOrCreateContact(
   phone: string,
   name: string
 ): Promise<ContactOutcome | null> {
-  // Find an existing contact for this account by phone. The shared
-  // helper pre-filters in SQL by the last-8-digit suffix (so we don't
-  // pull every contact on every inbound message) then applies the
-  // strict `phonesMatch` in JS on the small candidate set. The same
-  // helper backs the manual contact form and CSV import, so all three
-  // paths agree on what "same number" means (issue #212).
-  const existingContact = await findExistingContact(
-    supabaseAdmin(),
-    accountId,
-    phone,
-  )
+  const existingContact = await findExistingContact(accountId, phone)
 
   if (existingContact) {
-    // Update name if it changed
     if (name && name !== existingContact.name) {
-      await supabaseAdmin()
-        .from('contacts')
-        .update({ name, updated_at: new Date().toISOString() })
-        .eq('id', existingContact.id)
+      await prisma.contact.update({
+        where: { id: existingContact.id },
+        data: { name },
+      })
     }
     return { contact: existingContact, wasCreated: false }
   }
 
-  // Create new contact. account_id is the tenancy column;
-  // user_id is the NOT NULL FK audit column (no inbound message
-  // has a single "user who created" it — we attribute to the
-  // WhatsApp config owner as a stable default).
-  const { data: newContact, error: createError } = await supabaseAdmin()
-    .from('contacts')
-    .insert({
-      account_id: accountId,
-      user_id: configOwnerUserId,
-      phone,
-      name: name || phone,
+  try {
+    const newContact = await prisma.contact.create({
+      data: {
+        accountId,
+        userId: configOwnerUserId,
+        phone,
+        name: name || phone,
+      },
     })
-    .select()
-    .single()
-
-  if (createError) {
-    // Lost a race: a concurrent inbound delivery (or another path)
-    // created this contact between our lookup and insert, and the
-    // unique index (migration 022) rejected the duplicate. Re-resolve
-    // the existing row instead of dropping the message.
+    return { contact: newContact, wasCreated: true }
+  } catch (createError) {
     if (isUniqueViolation(createError)) {
-      const raced = await findExistingContact(supabaseAdmin(), accountId, phone)
+      const raced = await findExistingContact(accountId, phone)
       if (raced) return { contact: raced, wasCreated: false }
     }
     console.error('Error creating contact:', createError)
     return null
   }
-
-  return { contact: newContact, wasCreated: true }
 }
 
 async function findOrCreateConversation(
@@ -935,34 +894,24 @@ async function findOrCreateConversation(
   configOwnerUserId: string,
   contactId: string,
 ) {
-  // Look for existing conversation in this account
-  const { data: existing, error: findError } = await supabaseAdmin()
-    .from('conversations')
-    .select('*')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactId)
-    .single()
+  const existing = await prisma.conversation.findFirst({
+    where: { accountId, contactId },
+  })
 
-  if (!findError && existing) {
+  if (existing) {
     return existing
   }
 
-  // Create new conversation. Same tenancy + audit split as
-  // findOrCreateContact above.
-  const { data: newConv, error: createError } = await supabaseAdmin()
-    .from('conversations')
-    .insert({
-      account_id: accountId,
-      user_id: configOwnerUserId,
-      contact_id: contactId,
+  try {
+    return await prisma.conversation.create({
+      data: {
+        accountId,
+        userId: configOwnerUserId,
+        contactId,
+      },
     })
-    .select()
-    .single()
-
-  if (createError) {
+  } catch (createError) {
     console.error('Error creating conversation:', createError)
     return null
   }
-
-  return newConv
 }

@@ -1,4 +1,5 @@
-import { supabaseAdmin } from './admin-client'
+import { prisma } from '@/lib/prisma'
+import { Prisma } from '@/generated/prisma/client'
 
 // ------------------------------------------------------------
 // Builder payload → flat rows for automation_steps.
@@ -20,11 +21,11 @@ export interface BuilderStepInput {
 
 interface InsertRow {
   id: string
-  automation_id: string
-  parent_step_id: string | null
+  automationId: string
+  parentStepId: string | null
   branch: 'yes' | 'no' | null
-  step_type: string
-  step_config: Record<string, unknown>
+  stepType: string
+  stepConfig: Record<string, unknown>
   position: number
 }
 
@@ -37,12 +38,13 @@ export async function replaceSteps(
   automationId: string,
   input: BuilderStepInput[],
 ): Promise<string | null> {
-  const admin = supabaseAdmin()
-  const { error: delErr } = await admin
-    .from('automation_steps')
-    .delete()
-    .eq('automation_id', automationId)
-  if (delErr) return delErr.message
+  try {
+    await prisma.automationStep.deleteMany({
+      where: { automationId },
+    })
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
   return insertSteps(automationId, input)
 }
 
@@ -67,11 +69,11 @@ export async function insertSteps(
       const id = s.id ?? uid()
       rows.push({
         id,
-        automation_id: automationId,
-        parent_step_id: parentId,
+        automationId,
+        parentStepId: parentId,
         branch,
-        step_type: s.step_type,
-        step_config: s.step_config ?? {},
+        stepType: s.step_type,
+        stepConfig: s.step_config ?? {},
         position: idx,
       })
       if (s.step_type === 'condition' && s.branches) {
@@ -83,8 +85,17 @@ export async function insertSteps(
   walk(tree, null, null)
 
   if (rows.length === 0) return null
-  const { error } = await supabaseAdmin().from('automation_steps').insert(rows)
-  return error?.message ?? null
+  try {
+    await prisma.automationStep.createMany({
+      data: rows.map((row) => ({
+        ...row,
+        stepConfig: row.stepConfig as Prisma.InputJsonValue,
+      })),
+    })
+    return null
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
 }
 
 function seedsToTree(seeds: BuilderStepInput[]): BuilderStepInput[] {
@@ -118,38 +129,36 @@ export interface BuilderStepNode extends BuilderStepInput {
 
 interface DbStep {
   id: string
-  parent_step_id: string | null
+  parentStepId: string | null
   branch: 'yes' | 'no' | null
-  step_type: string
-  step_config: Record<string, unknown>
+  stepType: string
+  stepConfig: Record<string, unknown>
   position: number
 }
 
 export async function loadStepsTree(automationId: string): Promise<BuilderStepNode[]> {
-  const { data, error } = await supabaseAdmin()
-    .from('automation_steps')
-    .select('*')
-    .eq('automation_id', automationId)
-    .order('position', { ascending: true })
+  const rows = await prisma.automationStep.findMany({
+    where: { automationId },
+    orderBy: { position: 'asc' },
+  })
 
-  if (error) throw new Error(error.message)
-  const rows = (data ?? []) as DbStep[]
+  const typed = rows as DbStep[]
 
   const byId = new Map<string, BuilderStepNode>()
-  for (const row of rows) {
+  for (const row of typed) {
     byId.set(row.id, {
       id: row.id,
-      step_type: row.step_type,
-      step_config: row.step_config ?? {},
+      step_type: row.stepType,
+      step_config: (row.stepConfig as Record<string, unknown>) ?? {},
       branches: { yes: [], no: [] },
     })
   }
 
   const roots: BuilderStepNode[] = []
-  for (const row of rows) {
+  for (const row of typed) {
     const node = byId.get(row.id)!
-    if (row.parent_step_id) {
-      const parent = byId.get(row.parent_step_id)
+    if (row.parentStepId) {
+      const parent = byId.get(row.parentStepId)
       if (parent) {
         const bucket = (row.branch ?? 'yes') as 'yes' | 'no'
         parent.branches[bucket].push(node)

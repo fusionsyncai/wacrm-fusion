@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { fetchJson } from '@/lib/api/fetch-json';
 import { toast } from 'sonner';
 import type { Contact, Tag, ContactTag } from '@/types';
 import { Button } from '@/components/ui/button';
@@ -64,7 +64,6 @@ interface ContactWithTags extends Contact {
 }
 
 export default function ContactsPage() {
-  const supabase = createClient();
   const canEdit = useCan('send-messages');
   const canEditSettings = useCan('edit-settings');
 
@@ -102,19 +101,17 @@ export default function ContactsPage() {
   const fetchSeq = useRef(0);
 
   const fetchTags = useCallback(async () => {
-    const { data } = await supabase.from('tags').select('*');
+    const { tags: data } = await fetchJson<{ tags: Tag[] }>('/api/data/tags');
     if (data) {
       const map: Record<string, Tag> = {};
       data.forEach((t) => (map[t.id] = t));
       setTagsMap(map);
-      // Drop any filter selections whose tag no longer exists (e.g. a tag
-      // deleted elsewhere) so it can't linger invisibly in the query.
       setSelectedTagIds((prev) => {
         const pruned = prev.filter((id) => map[id]);
         return pruned.length === prev.length ? prev : pruned;
       });
     }
-  }, [supabase]);
+  }, []);
 
   const fetchContacts = useCallback(async () => {
     const seq = ++fetchSeq.current;
@@ -132,46 +129,32 @@ export default function ContactsPage() {
     let count: number;
 
     if (selectedTagIds.length > 0) {
-      // Tag filter active — resolve it server-side (join + distinct +
-      // windowed total count + pagination) so a tag covering many
-      // contacts can't silently truncate the result or overflow an IN
-      // clause. See migration 025_filter_contacts_by_tags.
-      const { data, error } = await supabase.rpc('filter_contacts_by_tags', {
-        p_tag_ids: selectedTagIds,
-        p_search: term || null,
-        p_limit: PAGE_SIZE,
-        p_offset: from,
+      const { rows: data } = await fetchJson<{
+        rows: Array<{ contact: Contact; total_count: number }>;
+      }>('/api/data/contacts/filter-by-tags', {
+        method: 'POST',
+        body: JSON.stringify({
+          tag_ids: selectedTagIds,
+          search: term || undefined,
+          limit: PAGE_SIZE,
+          offset: from,
+        }),
       });
-      if (seq !== fetchSeq.current) return; // superseded by a newer fetch
-      if (error) {
-        toast.error('Failed to load contacts');
-        setLoading(false);
-        return;
-      }
-      const rows = (data ?? []) as { contact: Contact; total_count: number }[];
-      contactRows = rows.map((r) => r.contact);
-      count = rows.length > 0 ? Number(rows[0].total_count) : 0;
+      if (seq !== fetchSeq.current) return;
+      contactRows = (data ?? []).map((r) => r.contact);
+      count = data && data.length > 0 ? Number(data[0].total_count) : 0;
     } else {
-      let query = supabase
-        .from('contacts')
-        .select('*', { count: 'exact' })
-        .order('created_at', { ascending: false })
-        .range(from, to);
-
-      if (term) {
-        const like = `%${term}%`;
-        query = query.or(`name.ilike.${like},phone.ilike.${like},email.ilike.${like}`);
-      }
-
-      const { data, count: exactCount, error } = await query;
-      if (seq !== fetchSeq.current) return; // superseded by a newer fetch
-      if (error) {
-        toast.error('Failed to load contacts');
-        setLoading(false);
-        return;
-      }
-      contactRows = data ?? [];
-      count = exactCount ?? 0;
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(PAGE_SIZE),
+      });
+      if (term) params.set('search', term);
+      const result = await fetchJson<{ contacts: Contact[]; total_count: number }>(
+        `/api/data/contacts?${params}`,
+      );
+      if (seq !== fetchSeq.current) return;
+      contactRows = result.contacts ?? [];
+      count = result.total_count ?? 0;
     }
 
     setTotalCount(count);
@@ -184,10 +167,9 @@ export default function ContactsPage() {
 
     // Fetch tags for these contacts
     const contactIds = contactRows.map((c) => c.id);
-    const { data: contactTags } = await supabase
-      .from('contact_tags')
-      .select('contact_id, tag_id')
-      .in('contact_id', contactIds);
+    const { contact_tags: contactTags } = await fetchJson<{
+      contact_tags: Array<{ contact_id: string; tag_id: string }>;
+    }>(`/api/data/contact-tags?contact_ids=${contactIds.join(',')}`);
     if (seq !== fetchSeq.current) return; // superseded by a newer fetch
 
     const tagsByContact: Record<string, string[]> = {};
@@ -205,7 +187,7 @@ export default function ContactsPage() {
 
     setContacts(enriched);
     setLoading(false);
-  }, [supabase, page, search, selectedTagIds, tagsMap]);
+  }, [page, search, selectedTagIds, tagsMap]);
 
   // Load-once-on-mount-ish data fetches. Each setter inside runs
   // inside an async promise completion (Supabase await), not
@@ -228,10 +210,9 @@ export default function ContactsPage() {
   }
 
   async function openEditForm(contact: Contact) {
-    const { data } = await supabase
-      .from('contact_tags')
-      .select('*')
-      .eq('contact_id', contact.id);
+    const { contact_tags: data } = await fetchJson<{ contact_tags: ContactTag[] }>(
+      `/api/data/contact-tags?contact_id=${contact.id}`,
+    );
     setEditContact(contact);
     setEditContactTags(data ?? []);
     setFormOpen(true);
@@ -251,16 +232,12 @@ export default function ContactsPage() {
     if (!deleteTarget) return;
     setDeleting(true);
 
-    const { error } = await supabase
-      .from('contacts')
-      .delete()
-      .eq('id', deleteTarget.id);
-
-    if (error) {
-      toast.error('Failed to delete contact');
-    } else {
+    try {
+      await fetchJson(`/api/data/contacts/${deleteTarget.id}`, { method: 'DELETE' });
       toast.success('Contact deleted');
       fetchContacts();
+    } catch {
+      toast.error('Failed to delete contact');
     }
 
     setDeleting(false);
@@ -298,14 +275,16 @@ export default function ContactsPage() {
     if (ids.length === 0) return;
     setDeleting(true);
 
-    const { error } = await supabase.from('contacts').delete().in('id', ids);
-
-    if (error) {
-      toast.error('Failed to delete contacts');
-    } else {
+    try {
+      await fetchJson('/api/data/contacts', {
+        method: 'DELETE',
+        body: JSON.stringify({ ids }),
+      });
       toast.success(`${ids.length} contact${ids.length === 1 ? '' : 's'} deleted`);
       setSelected(new Set());
       fetchContacts();
+    } catch {
+      toast.error('Failed to delete contacts');
     }
 
     setDeleting(false);

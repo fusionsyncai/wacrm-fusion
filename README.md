@@ -1,5 +1,8 @@
 # wacrm — CRM Template for WhatsApp
 
+NGROK URL:
+npx ngrok http --domain=deservedly-underaccommodated-maryrose.ngrok-free.dev 3000 --config ~/.ngrok1.yml
+
 > Self-hostable CRM template for WhatsApp® — shared inbox, contacts,
 > sales pipelines, broadcasts, and no-code automations. Fork it, brand
 > it, host it.
@@ -72,7 +75,9 @@ in an afternoon and make yours.
 git clone https://github.com/<your-username>/wacrm.git
 cd wacrm
 npm install
-cp .env.local.example .env.local   # fill in Supabase + Meta creds
+cp .env.local.example .env.local   # DATABASE_URL, DIRECT_URL, AUTH_SECRET, Meta creds
+npm install                        # runs prisma generate via postinstall
+npm run db:push                    # sync schema to Postgres
 npm run dev
 ```
 
@@ -127,8 +132,8 @@ Full walkthrough with screenshots:
 
 ## Documentation
 
-Full self-host documentation — Supabase migrations, WhatsApp Business
-API config, and production deploy — lives at
+Full self-host documentation — WhatsApp Business API config and
+production deploy — lives at
 **[wacrm.tech/docs](https://wacrm.tech/docs)**
 (source: [ArnasDon/wacrm-site](https://github.com/ArnasDon/wacrm-site)).
 
@@ -144,7 +149,8 @@ Key pages:
 ## Stack
 
 - **App** — Next.js 16 (App Router), React 19, TypeScript, Tailwind v4.
-- **Data** — Supabase (Postgres + Auth + Storage + RLS).
+- **Data** — Postgres via Prisma (`prisma/schema.prisma`, `db push`).
+- **Auth** — Auth.js (NextAuth v5) with email + password credentials.
 - **WhatsApp** — Meta Cloud API (official WhatsApp Business API).
 
 ## Contributing

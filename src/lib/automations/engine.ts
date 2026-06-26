@@ -14,8 +14,40 @@ import type {
   CreateDealStepConfig,
   AssignConversationStepConfig,
 } from '@/types'
-import { supabaseAdmin } from './admin-client'
+import type { Automation as PrismaAutomation, AutomationStep as PrismaAutomationStep } from '@/generated/prisma/client'
+import { Prisma } from '@/generated/prisma/client'
+import { prisma } from '@/lib/prisma'
 import { engineSendText, engineSendTemplate } from './meta-send'
+
+function toAutomation(row: PrismaAutomation): Automation {
+  return {
+    id: row.id,
+    account_id: row.accountId,
+    user_id: row.userId,
+    name: row.name,
+    description: row.description ?? undefined,
+    trigger_type: row.triggerType as Automation['trigger_type'],
+    trigger_config: row.triggerConfig as Automation['trigger_config'],
+    is_active: row.isActive,
+    execution_count: row.executionCount,
+    last_executed_at: row.lastExecutedAt?.toISOString() ?? null,
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+  }
+}
+
+function toAutomationStep(row: PrismaAutomationStep): AutomationStep {
+  return {
+    id: row.id,
+    automation_id: row.automationId,
+    parent_step_id: row.parentStepId,
+    branch: row.branch,
+    step_type: row.stepType as AutomationStep['step_type'],
+    step_config: row.stepConfig as AutomationStep['step_config'],
+    position: row.position,
+    created_at: row.createdAt.toISOString(),
+  }
+}
 
 // ------------------------------------------------------------
 // Public API
@@ -56,44 +88,28 @@ export interface DispatchInput {
  */
 export async function runAutomationsForTrigger(input: DispatchInput): Promise<void> {
   try {
-    const db = supabaseAdmin()
-
-    // Tenant isolation. `contactId` can be caller-supplied (the manual
-    // POST /api/automations/engine entrypoint reads it straight from the
-    // request body), and every step below runs through the service-role
-    // client, which bypasses RLS. So before any step can touch the
-    // contact, verify it actually belongs to this account. A foreign or
-    // forged id is refused silently — callers are fire-and-forget, and a
-    // distinct error would leak whether a given contact UUID exists.
     if (input.contactId) {
-      const { data: owned, error: ownErr } = await db
-        .from('contacts')
-        .select('id')
-        .eq('id', input.contactId)
-        .eq('account_id', input.accountId)
-        .maybeSingle()
-      if (ownErr) {
-        console.error('[automations] contact ownership check failed:', ownErr)
-        return
-      }
+      const owned = await prisma.contact.findFirst({
+        where: { id: input.contactId, accountId: input.accountId },
+        select: { id: true },
+      })
       if (!owned) {
         console.warn('[automations] contact not in account, refusing dispatch', input.contactId)
         return
       }
     }
 
-    const { data: automations, error } = await db
-      .from('automations')
-      .select('*')
-      .eq('account_id', input.accountId)
-      .eq('trigger_type', input.triggerType)
-      .eq('is_active', true)
+    const automations = (
+      await prisma.automation.findMany({
+        where: {
+          accountId: input.accountId,
+          triggerType: input.triggerType,
+          isActive: true,
+        },
+      })
+    ).map(toAutomation)
 
-    if (error) {
-      console.error('[automations] fetch failed:', error)
-      return
-    }
-    if (!automations || automations.length === 0) return
+    if (automations.length === 0) return
 
     for (const automation of automations as Automation[]) {
       if (!triggerMatches(automation, input.context)) continue
@@ -128,22 +144,21 @@ export async function resumePendingExecution(pending: {
   next_step_position: number
   context: AutomationContext
 }): Promise<void> {
-  const db = supabaseAdmin()
-  const { data: automation, error } = await db
-    .from('automations')
-    .select('*')
-    .eq('id', pending.automation_id)
-    .single()
+  const automationRow = await prisma.automation.findUnique({
+    where: { id: pending.automation_id },
+  })
 
-  if (error || !automation) {
-    console.error('[automations] resume: missing automation', pending.automation_id, error)
+  if (!automationRow) {
+    console.error('[automations] resume: missing automation', pending.automation_id)
     await markPending(pending.id, 'failed')
     return
   }
 
+  const automation = toAutomation(automationRow)
+
   try {
     await executeStepsFrom({
-      automation: automation as Automation,
+      automation,
       contactId: pending.contact_id,
       context: pending.context ?? {},
       parentStepId: pending.parent_step_id,
@@ -164,30 +179,17 @@ export async function resumePendingExecution(pending: {
 // ------------------------------------------------------------
 
 async function executeAutomation(automation: Automation, input: DispatchInput) {
-  const db = supabaseAdmin()
-
-  const { data: log, error: logErr } = await db
-    .from('automation_logs')
-    .insert({
-      automation_id: automation.id,
-      // Tenancy: matches automation.account_id (NOT NULL post-017).
-      account_id: automation.account_id,
-      // Audit: keeps the historical "author of this automation"
-      // pointer so logs still attribute to the right user even
-      // after teammates join the account.
-      user_id: automation.user_id,
-      contact_id: input.contactId ?? null,
-      trigger_event: input.triggerType,
-      steps_executed: [],
+  const log = await prisma.automationLog.create({
+    data: {
+      automationId: automation.id,
+      accountId: automation.account_id,
+      userId: automation.user_id,
+      contactId: input.contactId ?? null,
+      triggerEvent: input.triggerType,
+      stepsExecuted: [],
       status: 'success',
-    })
-    .select()
-    .single()
-
-  if (logErr || !log) {
-    console.error('[automations] cannot create log:', logErr)
-    return
-  }
+    },
+  })
 
   await executeStepsFrom({
     automation,
@@ -200,14 +202,9 @@ async function executeAutomation(automation: Automation, input: DispatchInput) {
     triggerEvent: input.triggerType,
   })
 
-  // Atomic counter update via the SQL function from migration 007.
-  // Doing this with a client-side read-modify-write raced when the
-  // same automation fired for two contacts simultaneously — both
-  // would read N and both write N+1, losing one count permanently.
-  const { error: rpcErr } = await db.rpc('increment_automation_execution_count', {
-    p_automation_id: automation.id,
-  })
-  if (rpcErr) {
+  try {
+    await prisma.$executeRaw`SELECT increment_automation_execution_count(${automation.id}::uuid)`
+  } catch (rpcErr) {
     console.error('[automations] increment counter failed:', rpcErr)
   }
 }
@@ -224,27 +221,20 @@ interface ExecuteArgs {
 }
 
 async function executeStepsFrom(args: ExecuteArgs): Promise<void> {
-  const db = supabaseAdmin()
+  const steps = (
+    await prisma.automationStep.findMany({
+      where: {
+        automationId: args.automation.id,
+        position: { gte: args.startPosition },
+        ...(args.parentStepId === null
+          ? { parentStepId: null }
+          : { parentStepId: args.parentStepId, branch: args.branch ?? 'yes' }),
+      },
+      orderBy: { position: 'asc' },
+    })
+  ).map(toAutomationStep)
 
-  const baseQuery = db
-    .from('automation_steps')
-    .select('*')
-    .eq('automation_id', args.automation.id)
-    .gte('position', args.startPosition)
-    .order('position', { ascending: true })
-
-  const scoped =
-    args.parentStepId === null
-      ? baseQuery.is('parent_step_id', null)
-      : baseQuery.eq('parent_step_id', args.parentStepId).eq('branch', args.branch ?? 'yes')
-
-  const { data: steps, error: stepsErr } = await scoped
-
-  if (stepsErr) {
-    await finalizeLog(args.logId, 'failed', stepsErr.message)
-    return
-  }
-  if (!steps || steps.length === 0) {
+  if (steps.length === 0) {
     if (args.parentStepId === null && args.logId) {
       await finalizeLog(args.logId, 'success', null)
     }
@@ -256,24 +246,23 @@ async function executeStepsFrom(args: ExecuteArgs): Promise<void> {
   let errorMessage: string | null = null
 
   for (const step of steps as AutomationStep[]) {
-    // `wait` is the suspension point: enqueue and stop processing this
-    // scope. The cron endpoint will pick it up later.
     if (step.step_type === 'wait') {
       const cfg = step.step_config as WaitStepConfig
       const ms = waitMs(cfg)
-      await db.from('automation_pending_executions').insert({
-        automation_id: args.automation.id,
-        // Tenancy: account_id required NOT NULL post-017.
-        account_id: args.automation.account_id,
-        user_id: args.automation.user_id,
-        contact_id: args.contactId,
-        log_id: args.logId,
-        parent_step_id: args.parentStepId,
-        branch: args.branch,
-        next_step_position: step.position + 1,
-        context: args.context,
-        run_at: new Date(Date.now() + ms).toISOString(),
-        status: 'pending',
+      await prisma.automationPendingExecution.create({
+        data: {
+          automationId: args.automation.id,
+          accountId: args.automation.account_id,
+          userId: args.automation.user_id,
+          contactId: args.contactId,
+          logId: args.logId,
+          parentStepId: args.parentStepId,
+          branch: args.branch,
+          nextStepPosition: step.position + 1,
+          context: args.context as Prisma.InputJsonValue,
+          runAt: new Date(Date.now() + ms),
+          status: 'pending',
+        },
       })
       results.push({
         step_id: step.id,
@@ -296,8 +285,6 @@ async function executeStepsFrom(args: ExecuteArgs): Promise<void> {
           status: 'success',
           detail: `branch=${taken ? 'yes' : 'no'}`,
         })
-        // Recurse into the chosen branch at position 0 (children use their
-        // own ordering within the branch scope).
         await executeStepsFrom({
           ...args,
           parentStepId: step.id,
@@ -332,14 +319,11 @@ async function executeStepsFrom(args: ExecuteArgs): Promise<void> {
   if (args.parentStepId === null) {
     await appendResults(args.logId, results, status, errorMessage)
   } else {
-    // Nested branch — just append results; parent scope decides final status.
     await appendResults(args.logId, results, null, errorMessage)
   }
 }
 
 async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string> {
-  const db = supabaseAdmin()
-
   switch (step.step_type) {
     case 'send_message': {
       const cfg = step.step_config as SendMessageStepConfig
@@ -362,10 +346,6 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
       if (!args.contactId) throw new Error('send_template needs a contact')
       if (!cfg.template_name) throw new Error('send_template needs template_name')
       const conversationId = await resolveConversationId(args)
-      // Meta templates use positional {{1}}, {{2}}, … placeholders, so
-      // we MUST emit params in strict numeric order. Lexicographic sort
-      // of "1", "2", …, "10" yields "1", "10", "2", … which silently
-      // scrambles every template with ≥10 variables.
       const params = cfg.variables
         ? Object.keys(cfg.variables)
             .sort((a, b) => {
@@ -393,30 +373,24 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
     }
 
     case 'add_tag': {
-      // contact_tags has no account_id column; cross-tenant protection for
-      // the attacker-supplied contactId comes from the ownership guard in
-      // runAutomationsForTrigger.
       const cfg = step.step_config as TagStepConfig
       if (!args.contactId || !cfg.tag_id) throw new Error('add_tag needs contact + tag_id')
-      await db
-        .from('contact_tags')
-        .upsert(
-          { contact_id: args.contactId, tag_id: cfg.tag_id },
-          { onConflict: 'contact_id,tag_id', ignoreDuplicates: true },
-        )
+      await prisma.contactTag.upsert({
+        where: {
+          contactId_tagId: { contactId: args.contactId, tagId: cfg.tag_id },
+        },
+        create: { contactId: args.contactId, tagId: cfg.tag_id },
+        update: {},
+      })
       return `tag ${cfg.tag_id} added`
     }
 
     case 'remove_tag': {
-      // See add_tag: tenant scoping relies on the runAutomationsForTrigger
-      // ownership guard, since contact_tags carries no account_id.
       const cfg = step.step_config as TagStepConfig
       if (!args.contactId || !cfg.tag_id) throw new Error('remove_tag needs contact + tag_id')
-      await db
-        .from('contact_tags')
-        .delete()
-        .eq('contact_id', args.contactId)
-        .eq('tag_id', cfg.tag_id)
+      await prisma.contactTag.deleteMany({
+        where: { contactId: args.contactId, tagId: cfg.tag_id },
+      })
       return `tag ${cfg.tag_id} removed`
     }
 
@@ -425,59 +399,54 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
       if (!args.contactId) throw new Error('assign_conversation needs a contact')
       let agentId = cfg.agent_id
       if (cfg.mode === 'round_robin') {
-        // Pick any member of the account. The existing implementation
-        // only ever returned the automation's author; preserving that
-        // shape until a real round-robin algorithm replaces it.
-        const { data: profiles } = await db
-          .from('profiles')
-          .select('user_id')
-          .eq('account_id', args.automation.account_id)
-          .limit(1)
-        agentId = profiles?.[0]?.user_id
+        const profile = await prisma.profile.findFirst({
+          where: { accountId: args.automation.account_id },
+          select: { userId: true },
+        })
+        agentId = profile?.userId
       }
       if (!agentId) return 'no agent resolved'
-      await db
-        .from('conversations')
-        .update({ assigned_agent_id: agentId })
-        .eq('account_id', args.automation.account_id)
-        .eq('contact_id', args.contactId)
+      await prisma.conversation.updateMany({
+        where: {
+          accountId: args.automation.account_id,
+          contactId: args.contactId,
+        },
+        data: { assignedAgentId: agentId },
+      })
       return `assigned to ${agentId}`
     }
 
     case 'update_contact_field': {
       const cfg = step.step_config as UpdateContactFieldStepConfig
       if (!args.contactId) throw new Error('update_contact_field needs a contact')
-      // Resolve workflow variables ({{ vars.* }}, {{ message.text }}) so custom
-      // values can be populated dynamically from the triggering context.
       const value = interpolate(cfg.value, args)
 
-      // Custom fields are encoded as `custom:<custom_field_id>`; anything else
-      // is a built-in contact column.
       if (cfg.field.startsWith('custom:')) {
         const customFieldId = cfg.field.slice('custom:'.length)
         if (!customFieldId) {
           return `field ${cfg.field} not writable from automations`
         }
-        // Defense in depth: the service-role client bypasses RLS, so confirm
-        // the field definition belongs to this account before writing.
-        const { data: field } = await db
-          .from('custom_fields')
-          .select('id')
-          .eq('id', customFieldId)
-          .eq('account_id', args.automation.account_id)
-          .maybeSingle()
+        const field = await prisma.customField.findFirst({
+          where: { id: customFieldId, accountId: args.automation.account_id },
+          select: { id: true },
+        })
         if (!field) {
           return `field ${cfg.field} not writable from automations`
         }
-        // Upsert on the table's UNIQUE(contact_id, custom_field_id) so repeated
-        // runs overwrite rather than duplicate. Tenancy is enforced above and,
-        // for the contact side, by the entry-point ownership guard.
-        await db
-          .from('contact_custom_values')
-          .upsert(
-            { contact_id: args.contactId, custom_field_id: customFieldId, value },
-            { onConflict: 'contact_id,custom_field_id' },
-          )
+        await prisma.contactCustomValue.upsert({
+          where: {
+            contactId_customFieldId: {
+              contactId: args.contactId,
+              customFieldId,
+            },
+          },
+          create: {
+            contactId: args.contactId,
+            customFieldId,
+            value,
+          },
+          update: { value },
+        })
         return `custom field updated`
       }
 
@@ -485,41 +454,35 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
       if (!allowed.has(cfg.field)) {
         return `field ${cfg.field} not writable from automations`
       }
-      // Defense in depth: scope the service-role write to the account so
-      // a future caller that skips the entry-point ownership guard still
-      // cannot write across tenants.
-      await db
-        .from('contacts')
-        .update({ [cfg.field]: value, updated_at: new Date().toISOString() })
-        .eq('id', args.contactId)
-        .eq('account_id', args.automation.account_id)
+      await prisma.contact.updateMany({
+        where: {
+          id: args.contactId,
+          accountId: args.automation.account_id,
+        },
+        data: { [cfg.field]: value },
+      })
       return `${cfg.field} updated`
     }
 
     case 'create_deal': {
       const cfg = step.step_config as CreateDealStepConfig
       if (!cfg.pipeline_id || !cfg.stage_id) throw new Error('create_deal needs pipeline + stage')
-      // Match the account's configured default currency rather than
-      // the static `deals.currency` DB default — keeps automation-
-      // created deals consistent with the one-currency-per-account
-      // rule (issue #218). Fall back to USD if the row is somehow
-      // missing the value (pre-021 forks).
-      const { data: acct } = await db
-        .from('accounts')
-        .select('default_currency')
-        .eq('id', args.automation.account_id)
-        .maybeSingle()
-      await db.from('deals').insert({
-        // Tenancy + audit, same split as automation_logs above.
-        account_id: args.automation.account_id,
-        user_id: args.automation.user_id,
-        pipeline_id: cfg.pipeline_id,
-        stage_id: cfg.stage_id,
-        contact_id: args.contactId,
-        title: interpolate(cfg.title, args),
-        value: cfg.value ?? 0,
-        currency: acct?.default_currency ?? 'USD',
-        status: 'open',
+      const acct = await prisma.account.findUnique({
+        where: { id: args.automation.account_id },
+        select: { defaultCurrency: true },
+      })
+      await prisma.deal.create({
+        data: {
+          accountId: args.automation.account_id,
+          userId: args.automation.user_id,
+          pipelineId: cfg.pipeline_id,
+          stageId: cfg.stage_id,
+          contactId: args.contactId,
+          title: interpolate(cfg.title, args),
+          value: cfg.value ?? 0,
+          currency: acct?.defaultCurrency ?? 'USD',
+          status: 'open',
+        },
       })
       return 'deal created'
     }
@@ -539,11 +502,13 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
 
     case 'close_conversation': {
       if (!args.contactId) throw new Error('close_conversation needs a contact')
-      await db
-        .from('conversations')
-        .update({ status: 'closed', updated_at: new Date().toISOString() })
-        .eq('account_id', args.automation.account_id)
-        .eq('contact_id', args.contactId)
+      await prisma.conversation.updateMany({
+        where: {
+          accountId: args.automation.account_id,
+          contactId: args.contactId,
+        },
+        data: { status: 'closed' },
+      })
       return 'conversation closed'
     }
 
@@ -556,26 +521,19 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
 // Helpers
 // ------------------------------------------------------------
 
-/**
- * Pick the conversation a send-type step should use. Prefer the id the
- * webhook handed us (it's the one that just got the inbound message);
- * fall back to the contact's conversation for resumed/wait paths and
- * manual engine POSTs. Throws if none exists — send steps have
- * no meaningful target without a conversation.
- */
 async function resolveConversationId(args: ExecuteArgs): Promise<string> {
   const fromCtx = args.context.conversation_id
   if (fromCtx) return fromCtx
   if (!args.contactId) throw new Error('cannot resolve conversation: no contact')
-  const { data, error } = await supabaseAdmin()
-    .from('conversations')
-    .select('id')
-    .eq('account_id', args.automation.account_id)
-    .eq('contact_id', args.contactId)
-    .maybeSingle()
-  if (error) throw new Error(`conversation lookup failed: ${error.message}`)
+  const data = await prisma.conversation.findFirst({
+    where: {
+      accountId: args.automation.account_id,
+      contactId: args.contactId,
+    },
+    select: { id: true },
+  })
   if (!data?.id) throw new Error('no conversation for contact')
-  return data.id as string
+  return data.id
 }
 
 function triggerMatches(automation: Automation, ctx: AutomationContext | undefined): boolean {
@@ -592,31 +550,28 @@ function triggerMatches(automation: Automation, ctx: AutomationContext | undefin
 }
 
 async function evaluateCondition(cfg: ConditionStepConfig, args: ExecuteArgs): Promise<boolean> {
-  const db = supabaseAdmin()
   switch (cfg.subject) {
     case 'tag_presence': {
       if (!args.contactId || !cfg.operand) return false
-      // contact_tags has no account_id column (its RLS keys off the parent
-      // contact), so tenant scoping here relies on the contact-ownership
-      // guard in runAutomationsForTrigger.
-      const { count } = await db
-        .from('contact_tags')
-        .select('id', { count: 'exact', head: true })
-        .eq('contact_id', args.contactId)
-        .eq('tag_id', cfg.operand)
-      return (count ?? 0) > 0
+      const count = await prisma.contactTag.count({
+        where: { contactId: args.contactId, tagId: cfg.operand },
+      })
+      return count > 0
     }
     case 'contact_field': {
       if (!args.contactId || !cfg.operand) return false
-      // Scope to the account so the condition can't be turned into a
-      // cross-tenant read oracle via the service-role client.
-      const { data } = await db
-        .from('contacts')
-        .select(cfg.operand)
-        .eq('id', args.contactId)
-        .eq('account_id', args.automation.account_id)
-        .maybeSingle()
-      const v = (data as Record<string, unknown> | null)?.[cfg.operand]
+      const allowed = new Set(['name', 'email', 'phone', 'company'])
+      if (!allowed.has(cfg.operand)) return false
+      const data = await prisma.contact.findFirst({
+        where: { id: args.contactId, accountId: args.automation.account_id },
+        select: {
+          name: true,
+          email: true,
+          phone: true,
+          company: true,
+        },
+      })
+      const v = data?.[cfg.operand as keyof typeof data]
       return v != null && String(v) === String(cfg.value ?? '')
     }
     case 'message_content': {
@@ -624,8 +579,6 @@ async function evaluateCondition(cfg: ConditionStepConfig, args: ExecuteArgs): P
       return text.toLowerCase().includes((cfg.value ?? '').toLowerCase())
     }
     case 'time_of_day': {
-      // operand form "HH:mm-HH:mm" — true if now is within that window
-      // (supports over-midnight ranges like "18:00-09:00").
       const [from, to] = (cfg.operand ?? '').split('-')
       if (!from || !to) return false
       const now = new Date()
@@ -664,23 +617,27 @@ async function appendResults(
   errorMessage: string | null,
 ) {
   if (!logId) return
-  const db = supabaseAdmin()
-  const { data: existing } = await db
-    .from('automation_logs')
-    .select('steps_executed, status')
-    .eq('id', logId)
-    .single()
+  const existing = await prisma.automationLog.findUnique({
+    where: { id: logId },
+    select: { stepsExecuted: true },
+  })
   const merged = [
-    ...((existing?.steps_executed as AutomationLogStepResult[] | undefined) ?? []),
+    ...((existing?.stepsExecuted as AutomationLogStepResult[] | undefined) ?? []),
     ...newItems,
   ]
-  const update: Record<string, unknown> = { steps_executed: merged }
-  // Only overwrite status on the outermost scope — nested branches pass null.
+  const update: {
+    stepsExecuted: Prisma.InputJsonValue
+    status?: 'success' | 'partial' | 'failed'
+    errorMessage?: string | null
+  } = { stepsExecuted: merged as unknown as Prisma.InputJsonValue }
   if (status !== null) {
     update.status = status
   }
-  if (errorMessage) update.error_message = errorMessage
-  await db.from('automation_logs').update(update).eq('id', logId)
+  if (errorMessage) update.errorMessage = errorMessage
+  await prisma.automationLog.update({
+    where: { id: logId },
+    data: update,
+  })
 }
 
 async function finalizeLog(
@@ -689,15 +646,15 @@ async function finalizeLog(
   errorMessage: string | null,
 ) {
   if (!logId) return
-  await supabaseAdmin()
-    .from('automation_logs')
-    .update({ status, error_message: errorMessage })
-    .eq('id', logId)
+  await prisma.automationLog.update({
+    where: { id: logId },
+    data: { status, errorMessage },
+  })
 }
 
 async function markPending(id: string, status: 'done' | 'failed') {
-  await supabaseAdmin()
-    .from('automation_pending_executions')
-    .update({ status })
-    .eq('id', id)
+  await prisma.automationPendingExecution.update({
+    where: { id },
+    data: { status },
+  })
 }

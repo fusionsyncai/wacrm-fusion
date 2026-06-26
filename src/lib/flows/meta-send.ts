@@ -14,7 +14,7 @@ import {
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
-import { supabaseAdmin } from './admin-client'
+import { prisma } from '@/lib/prisma'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -60,15 +60,11 @@ interface SendTextEngineArgs {
 export async function engineSendText(
   args: SendTextEngineArgs,
 ): Promise<{ whatsapp_message_id: string }> {
-  const db = supabaseAdmin()
-
-  const { data: contact, error: contactErr } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('id', args.contactId)
-    .eq('account_id', args.accountId)
-    .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  const contact = await prisma.contact.findFirst({
+    where: { id: args.contactId, accountId: args.accountId },
+    select: { id: true, phone: true },
+  })
+  if (!contact?.phone) {
     throw new Error('contact not found for this account')
   }
 
@@ -77,20 +73,18 @@ export async function engineSendText(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
+  const config = await prisma.whatsappConfig.findUnique({
+    where: { accountId: args.accountId },
+  })
+  if (!config) {
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  const accessToken = decrypt(config.accessToken)
 
   const attempt = async (phone: string): Promise<string> => {
     const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: config.phoneNumberId,
       accessToken,
       to: phone,
       text: args.text,
@@ -117,29 +111,30 @@ export async function engineSendText(
   if (lastError) throw lastError
 
   if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
-  }
-
-  const { error: msgErr } = await db.from('messages').insert({
-    conversation_id: args.conversationId,
-    sender_type: 'bot',
-    content_type: 'text',
-    content_text: args.text,
-    message_id: waMessageId,
-    status: 'sent',
-  })
-  if (msgErr) {
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
-  }
-
-  await db
-    .from('conversations')
-    .update({
-      last_message_text: args.text,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+    await prisma.contact.update({
+      where: { id: contact.id },
+      data: { phone: workingPhone },
     })
-    .eq('id', args.conversationId)
+  }
+
+  await prisma.message.create({
+    data: {
+      conversationId: args.conversationId,
+      senderType: 'bot',
+      contentType: 'text',
+      contentText: args.text,
+      messageId: waMessageId,
+      status: 'sent',
+    },
+  })
+
+  await prisma.conversation.update({
+    where: { id: args.conversationId },
+    data: {
+      lastMessageText: args.text,
+      lastMessageAt: new Date(),
+    },
+  })
 
   return { whatsapp_message_id: waMessageId }
 }
@@ -169,15 +164,11 @@ interface SendMediaEngineArgs {
 export async function engineSendMedia(
   args: SendMediaEngineArgs,
 ): Promise<{ whatsapp_message_id: string }> {
-  const db = supabaseAdmin()
-
-  const { data: contact, error: contactErr } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('id', args.contactId)
-    .eq('account_id', args.accountId)
-    .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  const contact = await prisma.contact.findFirst({
+    where: { id: args.contactId, accountId: args.accountId },
+    select: { id: true, phone: true },
+  })
+  if (!contact?.phone) {
     throw new Error('contact not found for this account')
   }
 
@@ -186,20 +177,18 @@ export async function engineSendMedia(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
+  const config = await prisma.whatsappConfig.findUnique({
+    where: { accountId: args.accountId },
+  })
+  if (!config) {
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  const accessToken = decrypt(config.accessToken)
 
   const attempt = async (phone: string): Promise<string> => {
     const r = await sendMediaMessage({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: config.phoneNumberId,
       accessToken,
       to: phone,
       kind: args.kind,
@@ -229,34 +218,31 @@ export async function engineSendMedia(
   if (lastError) throw lastError
 
   if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
-  }
-
-  // content_type='image'|'video'|'document' — these are already in the
-  // messages_content_type_check constraint (migration 001 + 010).
-  // content_text carries the caption (or empty) so the conversation
-  // list preview shows something meaningful when the user glances at it.
-  const preview = args.caption?.trim() || `[${args.kind}]`
-  const { error: msgErr } = await db.from('messages').insert({
-    conversation_id: args.conversationId,
-    sender_type: 'bot',
-    content_type: args.kind,
-    content_text: args.caption ?? null,
-    message_id: waMessageId,
-    status: 'sent',
-  })
-  if (msgErr) {
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
-  }
-
-  await db
-    .from('conversations')
-    .update({
-      last_message_text: preview,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+    await prisma.contact.update({
+      where: { id: contact.id },
+      data: { phone: workingPhone },
     })
-    .eq('id', args.conversationId)
+  }
+
+  const preview = args.caption?.trim() || `[${args.kind}]`
+  await prisma.message.create({
+    data: {
+      conversationId: args.conversationId,
+      senderType: 'bot',
+      contentType: args.kind,
+      contentText: args.caption ?? null,
+      messageId: waMessageId,
+      status: 'sent',
+    },
+  })
+
+  await prisma.conversation.update({
+    where: { id: args.conversationId },
+    data: {
+      lastMessageText: preview,
+      lastMessageAt: new Date(),
+    },
+  })
 
   return { whatsapp_message_id: waMessageId }
 }
@@ -318,18 +304,11 @@ type SendInput =
 async function sendInteractiveViaMeta(
   input: SendInput,
 ): Promise<{ whatsapp_message_id: string }> {
-  const db = supabaseAdmin()
-
-  // Scope the contact + whatsapp_config lookups by account_id —
-  // same defense-in-depth rationale as automations/meta-send.ts.
-  // Migration 017 moved both tables to account-scoped tenancy.
-  const { data: contact, error: contactErr } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('id', input.contactId)
-    .eq('account_id', input.accountId)
-    .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  const contact = await prisma.contact.findFirst({
+    where: { id: input.contactId, accountId: input.accountId },
+    select: { id: true, phone: true },
+  })
+  if (!contact?.phone) {
     throw new Error('contact not found for this account')
   }
 
@@ -338,21 +317,19 @@ async function sendInteractiveViaMeta(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
+  const config = await prisma.whatsappConfig.findUnique({
+    where: { accountId: input.accountId },
+  })
+  if (!config) {
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  const accessToken = decrypt(config.accessToken)
 
   const attempt = async (phone: string): Promise<string> => {
     if (input.kind === 'buttons') {
       const r = await sendInteractiveButtons({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         bodyText: input.bodyText,
@@ -363,7 +340,7 @@ async function sendInteractiveViaMeta(
       return r.messageId
     }
     const r = await sendInteractiveList({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: config.phoneNumberId,
       accessToken,
       to: phone,
       bodyText: input.bodyText,
@@ -375,9 +352,6 @@ async function sendInteractiveViaMeta(
     return r.messageId
   }
 
-  // Same phone-variant retry as automations/meta-send.ts. Numbers
-  // registered with/without a trunk 0 + Meta's sandbox quirks all
-  // need this to reliably land a message.
   const variants = phoneVariants(sanitized)
   let workingPhone = sanitized
   let waMessageId = ''
@@ -397,38 +371,30 @@ async function sendInteractiveViaMeta(
   if (lastError) throw lastError
 
   if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
-  }
-
-  // Persist the bot's prompt to the messages table so it appears in
-  // the inbox. content_type='interactive' is supported as of
-  // migration 010; sender_type='bot' distinguishes flow sends from
-  // manual agent sends (the conversation list preview will pick up
-  // last_message_text as a sensible summary).
-  //
-  // We do NOT set interactive_reply_id here — that column is reserved
-  // for the customer's tap on this message, populated by the webhook
-  // when their reply arrives.
-  const { error: msgErr } = await db.from('messages').insert({
-    conversation_id: input.conversationId,
-    sender_type: 'bot',
-    content_type: 'interactive',
-    content_text: input.bodyText,
-    message_id: waMessageId,
-    status: 'sent',
-  })
-  if (msgErr) {
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
-  }
-
-  await db
-    .from('conversations')
-    .update({
-      last_message_text: input.bodyText,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+    await prisma.contact.update({
+      where: { id: contact.id },
+      data: { phone: workingPhone },
     })
-    .eq('id', input.conversationId)
+  }
+
+  await prisma.message.create({
+    data: {
+      conversationId: input.conversationId,
+      senderType: 'bot',
+      contentType: 'interactive',
+      contentText: input.bodyText,
+      messageId: waMessageId,
+      status: 'sent',
+    },
+  })
+
+  await prisma.conversation.update({
+    where: { id: input.conversationId },
+    data: {
+      lastMessageText: input.bodyText,
+      lastMessageAt: new Date(),
+    },
+  })
 
   return { whatsapp_message_id: waMessageId }
 }

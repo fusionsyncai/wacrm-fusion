@@ -1,75 +1,82 @@
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { supabaseAdmin } from '@/lib/automations/admin-client'
+import { NextResponse } from "next/server";
+
+import type { Prisma } from "@/generated/prisma/client";
+import { getCurrentAccount, toErrorResponse } from "@/lib/auth/account";
+import { serializeAutomation } from "@/lib/db/api-serialize";
+import { prisma } from "@/lib/prisma";
 
 export async function POST(
   _request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await params
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  try {
+    const ctx = await getCurrentAccount();
+    const { id } = await params;
 
-  const admin = supabaseAdmin()
-  const { data: original, error: origErr } = await admin
-    .from('automations')
-    .select('*')
-    .eq('id', id)
-    .eq('user_id', user.id)
-    .maybeSingle()
-  if (origErr) return NextResponse.json({ error: origErr.message }, { status: 500 })
-  if (!original) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    const original = await prisma.automation.findFirst({
+      where: { id, accountId: ctx.accountId },
+    });
+    if (!original) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
 
-  const { data: copy, error: copyErr } = await admin
-    .from('automations')
-    .insert({
-      // Clone into the same account as the original. account_id is NOT
-      // NULL post-017, so the INSERT fails the constraint without it.
-      account_id: original.account_id,
-      user_id: user.id,
-      name: `${original.name} (Copy)`,
-      description: original.description,
-      trigger_type: original.trigger_type,
-      trigger_config: original.trigger_config,
-      is_active: false,
-    })
-    .select()
-    .single()
-  if (copyErr || !copy) {
-    return NextResponse.json({ error: copyErr?.message ?? 'copy failed' }, { status: 500 })
+    const copy = await prisma.$transaction(async (tx) => {
+      const automation = await tx.automation.create({
+        data: {
+          accountId: original.accountId,
+          userId: ctx.userId,
+          name: `${original.name} (Copy)`,
+          description: original.description,
+          triggerType: original.triggerType,
+          triggerConfig: original.triggerConfig as Prisma.InputJsonValue,
+          isActive: false,
+        },
+      });
+
+      const steps = await tx.automationStep.findMany({
+        where: { automationId: id },
+        orderBy: { position: "asc" },
+        select: {
+          id: true,
+          parentStepId: true,
+          branch: true,
+          stepType: true,
+          stepConfig: true,
+          position: true,
+        },
+      });
+
+      if (steps.length > 0) {
+        const idMap = new Map<string, string>();
+        const uid = () =>
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2) + Date.now().toString(36);
+        for (const row of steps) idMap.set(row.id, uid());
+
+        await tx.automationStep.createMany({
+          data: steps.map((row) => ({
+            id: idMap.get(row.id)!,
+            automationId: automation.id,
+            parentStepId: row.parentStepId
+              ? idMap.get(row.parentStepId)
+              : null,
+            branch: row.branch,
+            stepType: row.stepType,
+            stepConfig: row.stepConfig ?? {},
+            position: row.position,
+          })),
+        });
+      }
+
+      return automation;
+    });
+
+    return NextResponse.json(
+      { automation: serializeAutomation(copy) },
+      { status: 201 },
+    );
+  } catch (err) {
+    return toErrorResponse(err);
   }
-
-  const { data: steps } = await admin
-    .from('automation_steps')
-    .select('id, parent_step_id, branch, step_type, step_config, position')
-    .eq('automation_id', id)
-    .order('position', { ascending: true })
-
-  if (steps && steps.length > 0) {
-    // Re-map parent_step_id: build old→new id map first so the second
-    // pass inserts rows with correct parent references.
-    const idMap = new Map<string, string>()
-    const uid = () =>
-      typeof crypto !== 'undefined' && 'randomUUID' in crypto
-        ? crypto.randomUUID()
-        : Math.random().toString(36).slice(2) + Date.now().toString(36)
-    for (const row of steps) idMap.set(row.id as string, uid())
-
-    const rows = steps.map((row) => ({
-      id: idMap.get(row.id as string)!,
-      automation_id: copy.id,
-      parent_step_id: row.parent_step_id ? idMap.get(row.parent_step_id as string) : null,
-      branch: row.branch,
-      step_type: row.step_type,
-      step_config: row.step_config,
-      position: row.position,
-    }))
-    const { error: insErr } = await admin.from('automation_steps').insert(rows)
-    if (insErr) return NextResponse.json({ error: insErr.message }, { status: 500 })
-  }
-
-  return NextResponse.json({ automation: copy }, { status: 201 })
 }

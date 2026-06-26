@@ -1,14 +1,5 @@
 // ============================================================
 // /api/account
-//
-//   GET   — current caller's account + role. Any member.
-//   PATCH — rename the account.                  Admin+.
-//
-// Why both verbs share a route file
-//   They speak about the same singular resource (the caller's
-//   account) and reuse the same `requireRole` plumbing. Splitting
-//   them across files would duplicate the `account_id` lookup
-//   without buying anything.
 // ============================================================
 
 import { NextResponse } from "next/server";
@@ -18,6 +9,7 @@ import {
   getCurrentAccount,
   toErrorResponse,
 } from "@/lib/auth/account";
+import { prisma } from "@/lib/prisma";
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -42,10 +34,6 @@ export async function PATCH(request: Request) {
   try {
     const ctx = await requireRole("admin");
 
-    // Per-user limit on admin-class mutations. Bounds accidental
-    // abuse (script run in a loop) and a compromised admin session
-    // spamming renames. Each admin endpoint keys its own bucket so
-    // one route doesn't starve another.
     const limit = checkRateLimit(
       `admin:rename:${ctx.userId}`,
       RATE_LIMITS.adminAction,
@@ -53,9 +41,31 @@ export async function PATCH(request: Request) {
     if (!limit.success) return rateLimitResponse(limit);
 
     const body = (await request.json().catch(() => null)) as
-      | { name?: unknown }
+      | { name?: unknown; default_currency?: unknown }
       | null;
     const rawName = body?.name;
+    const rawCurrency = body?.default_currency;
+
+    if (rawCurrency !== undefined) {
+      if (typeof rawCurrency !== "string" || rawCurrency.trim().length === 0) {
+        return NextResponse.json(
+          { error: "'default_currency' must be a non-empty string" },
+          { status: 400 },
+        );
+      }
+      const account = await prisma.account.update({
+        where: { id: ctx.accountId },
+        data: { defaultCurrency: rawCurrency.trim() },
+        select: { id: true, name: true, defaultCurrency: true },
+      });
+      return NextResponse.json({
+        account: {
+          id: account.id,
+          name: account.name,
+          default_currency: account.defaultCurrency,
+        },
+      });
+    }
 
     if (typeof rawName !== "string") {
       return NextResponse.json(
@@ -78,25 +88,13 @@ export async function PATCH(request: Request) {
       );
     }
 
-    // RLS allows this UPDATE because accounts_update requires
-    // `is_account_member(id, 'admin')`, and requireRole already
-    // guaranteed the caller is admin+.
-    const { data, error } = await ctx.supabase
-      .from("accounts")
-      .update({ name })
-      .eq("id", ctx.accountId)
-      .select("id, name")
-      .single();
+    const account = await prisma.account.update({
+      where: { id: ctx.accountId },
+      data: { name },
+      select: { id: true, name: true },
+    });
 
-    if (error) {
-      console.error("[PATCH /api/account] update error:", error);
-      return NextResponse.json(
-        { error: "Failed to update account" },
-        { status: 500 },
-      );
-    }
-
-    return NextResponse.json({ account: data });
+    return NextResponse.json({ account });
   } catch (err) {
     return toErrorResponse(err);
   }

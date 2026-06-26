@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import type { Prisma } from '@/generated/prisma/client'
+import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account'
+import { serializeMessageTemplate } from '@/lib/db/api-serialize'
+import { prisma } from '@/lib/prisma'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   deleteMessageTemplate,
@@ -56,29 +59,8 @@ export async function PATCH(
         { status: 400 },
       )
     }
-    const supabase = await createClient()
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    // Resolve the caller's account_id so template + whatsapp_config
-    // lookups work for teammates who didn't author the row.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
+    const ctx = await getCurrentAccount()
+    const accountId = ctx.accountId
 
     let payload: TemplatePayload
     try {
@@ -89,17 +71,21 @@ export async function PATCH(
 
     // RLS handles ownership, but we need the existing row to read
     // meta_template_id and status — fetch explicitly.
-    const { data: existing, error: lookupErr } = await supabase
-      .from('message_templates')
-      .select('id, name, status, meta_template_id, language')
-      .eq('id', id)
-      .eq('account_id', accountId)
-      .maybeSingle()
-    if (lookupErr || !existing) {
+    const existing = await prisma.messageTemplate.findFirst({
+      where: { id, accountId },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        metaTemplateId: true,
+        language: true,
+      },
+    })
+    if (!existing) {
       return NextResponse.json({ error: 'Template not found.' }, { status: 404 })
     }
 
-    if (!existing.meta_template_id) {
+    if (!existing.metaTemplateId) {
       return NextResponse.json(
         {
           error:
@@ -138,18 +124,16 @@ export async function PATCH(
     }
 
     if (!isDryRun()) {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config) {
+      const config = await prisma.whatsappConfig.findUnique({
+        where: { accountId },
+      })
+      if (!config) {
         return NextResponse.json(
           { error: 'WhatsApp not configured.' },
           { status: 400 },
         )
       }
-      const accessToken = decrypt(config.access_token)
+      const accessToken = decrypt(config.accessToken)
 
       // Image headers need a fresh Resumable-Upload handle on every edit
       // (Meta replaces components wholesale). Derive from header_media_url.
@@ -165,60 +149,55 @@ export async function PATCH(
       const metaPayload = buildMetaTemplatePayload(payload)
       try {
         await editMessageTemplate({
-          metaTemplateId: existing.meta_template_id,
+          metaTemplateId: existing.metaTemplateId,
           accessToken,
           components: metaPayload.components,
         })
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Meta edit failed.'
-        await supabase
-          .from('message_templates')
-          .update({
-            submission_error: message,
-            last_submitted_at: new Date().toISOString(),
-          })
-          .eq('id', id)
+        await prisma.messageTemplate.update({
+          where: { id },
+          data: {
+            submissionError: message,
+            lastSubmittedAt: new Date(),
+          },
+        })
         return NextResponse.json({ error: message }, { status: 502 })
       }
     }
 
     // Meta accepted the edit — status flips back to PENDING for review.
-    const { data: row, error: updErr } = await supabase
-      .from('message_templates')
-      .update({
+    const row = await prisma.messageTemplate.update({
+      where: { id },
+      data: {
         category: payload.category,
-        header_type: payload.header_type ?? null,
-        header_content: payload.header_content ?? null,
-        header_media_url: payload.header_media_url ?? null,
-        header_handle: payload.header_handle ?? null,
-        body_text: payload.body_text,
-        footer_text: payload.footer_text ?? null,
-        buttons: payload.buttons ?? null,
-        sample_values: payload.sample_values ?? null,
+        headerType: payload.header_type ?? null,
+        headerContent: payload.header_content ?? null,
+        headerMediaUrl: payload.header_media_url ?? null,
+        headerHandle: payload.header_handle ?? null,
+        bodyText: payload.body_text,
+        footerText: payload.footer_text ?? null,
+        buttons: payload.buttons ?? undefined,
+        sampleValues: (payload.sample_values ?? undefined) as Prisma.InputJsonValue | undefined,
         status: 'PENDING',
-        submission_error: null,
-        rejection_reason: null,
-        last_submitted_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    if (updErr) {
-      return NextResponse.json(
-        {
-          error: `Edited on Meta but failed to save locally: ${updErr.message}. Run "Sync from Meta" to recover.`,
-        },
-        { status: 500 },
-      )
-    }
+        submissionError: null,
+        rejectionReason: null,
+        lastSubmittedAt: new Date(),
+      },
+    })
 
     return NextResponse.json({
       success: true,
-      template: row,
+      template: serializeMessageTemplate(row),
       dry_run: isDryRun(),
     })
   } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === 'UnauthorizedError' || error.name === 'ForbiddenError')
+    ) {
+      return toErrorResponse(error)
+    }
     console.error('Error editing template:', error)
     return NextResponse.json(
       {
@@ -242,60 +221,34 @@ export async function DELETE(
         { status: 400 },
       )
     }
-    const supabase = await createClient()
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const ctx = await getCurrentAccount()
+    const accountId = ctx.accountId
 
-    // Same account-scoping rationale as the PATCH handler above —
-    // teammates need to be able to operate on shared templates +
-    // the shared whatsapp_config.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
-
-    const { data: existing, error: lookupErr } = await supabase
-      .from('message_templates')
-      .select('id, name, meta_template_id')
-      .eq('id', id)
-      .eq('account_id', accountId)
-      .maybeSingle()
-    if (lookupErr || !existing) {
+    const existing = await prisma.messageTemplate.findFirst({
+      where: { id, accountId },
+      select: { id: true, name: true, metaTemplateId: true },
+    })
+    if (!existing) {
       return NextResponse.json({ error: 'Template not found.' }, { status: 404 })
     }
 
-    if (existing.meta_template_id && !isDryRun()) {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config || !config.waba_id) {
+    if (existing.metaTemplateId && !isDryRun()) {
+      const config = await prisma.whatsappConfig.findUnique({
+        where: { accountId },
+      })
+      if (!config?.wabaId) {
         return NextResponse.json(
           { error: 'WhatsApp not configured — cannot delete on Meta.' },
           { status: 400 },
         )
       }
-      const accessToken = decrypt(config.access_token)
+      const accessToken = decrypt(config.accessToken)
       try {
         await deleteMessageTemplate({
-          wabaId: config.waba_id,
+          wabaId: config.wabaId,
           accessToken,
           name: existing.name,
-          metaTemplateId: existing.meta_template_id,
+          metaTemplateId: existing.metaTemplateId,
         })
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Meta delete failed.'
@@ -303,21 +256,16 @@ export async function DELETE(
       }
     }
 
-    const { error: delErr } = await supabase
-      .from('message_templates')
-      .delete()
-      .eq('id', id)
-    if (delErr) {
-      return NextResponse.json(
-        {
-          error: `Deleted on Meta but failed to delete locally: ${delErr.message}.`,
-        },
-        { status: 500 },
-      )
-    }
+    await prisma.messageTemplate.delete({ where: { id } })
 
     return NextResponse.json({ success: true, dry_run: isDryRun() })
   } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === 'UnauthorizedError' || error.name === 'ForbiddenError')
+    ) {
+      return toErrorResponse(error)
+    }
     console.error('Error deleting template:', error)
     return NextResponse.json(
       {

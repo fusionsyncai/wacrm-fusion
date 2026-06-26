@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { createClient } from "@/lib/supabase/client";
+import { fetchJson } from "@/lib/api/fetch-json";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
@@ -13,13 +13,16 @@ import type {
   MessageReaction,
   Contact,
   ConversationStatus,
+  ConversationHandlingMode,
   MessageTemplate,
   Profile,
+  AiAgent,
 } from "@/types";
 import {
   MessageSquare,
   ChevronDown,
   UserPlus,
+  Bot,
   Check,
   Clock,
   ArrowLeft,
@@ -48,6 +51,7 @@ import { deleteAccountMedia } from "@/lib/storage/upload-media";
 import { TemplatePicker } from "./template-picker";
 import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
+import { useCan } from "@/hooks/use-can";
 
 interface ReplyDraft {
   id: string;
@@ -73,6 +77,14 @@ interface MessageThreadProps {
   onAssignChange: (
     conversationId: string,
     assignedAgentId: string | null,
+  ) => void;
+  onAiAgentChange?: (
+    conversationId: string,
+    aiAgentId: string | null,
+  ) => void;
+  onHandlingModeChange?: (
+    conversationId: string,
+    mode: ConversationHandlingMode,
   ) => void;
   /**
    * On mobile, the thread is shown full-screen with the conversation list
@@ -159,6 +171,8 @@ export function MessageThread({
   onUpdateMessage,
   onStatusChange,
   onAssignChange,
+  onAiAgentChange,
+  onHandlingModeChange,
   onBack,
   resyncToken = 0,
   onRefresh,
@@ -166,11 +180,13 @@ export function MessageThread({
   onToggleContactPanel,
 }: MessageThreadProps) {
   const { user } = useAuth();
+  const canEdit = useCan("send-messages");
   const { getPresence, getRow, now } = usePresence();
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [aiAgents, setAiAgents] = useState<AiAgent[]>([]);
   const [reactions, setReactions] = useState<MessageReaction[]>([]);
   // Purely visual spin state for the manual-refresh button. The actual
   // refetch is fire-and-forget through `onRefresh` (which bumps the
@@ -201,18 +217,28 @@ export function MessageThread({
   // shape ready for shared-team workspaces without a refactor.
   useEffect(() => {
     let cancelled = false;
-    const supabase = createClient();
-    supabase
-      .from("profiles")
-      .select("*")
-      .order("full_name")
-      .then(({ data, error }) => {
+    fetchJson<{ profiles: Profile[] }>('/api/data/profiles')
+      .then(({ profiles: data }) => {
         if (cancelled) return;
-        if (error) {
-          console.error("Failed to fetch profiles:", error);
-          return;
-        }
-        setProfiles((data as Profile[]) ?? []);
+        setProfiles(data ?? []);
+      })
+      .catch((error) => {
+        console.error('Failed to fetch profiles:', error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchJson<{ agents: AiAgent[] }>("/api/agents")
+      .then(({ agents: data }) => {
+        if (cancelled) return;
+        setAiAgents(data ?? []);
+      })
+      .catch((error) => {
+        console.error("Failed to fetch AI agents:", error);
       });
     return () => {
       cancelled = true;
@@ -261,43 +287,56 @@ export function MessageThread({
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
 
-  // Fetch messages whenever the selected conversation changes. Kept
-  // separate from the unread-reset effect so that incoming messages
-  // arriving while the thread is open don't trigger a full refetch —
-  // they only flip hasUnread, which only the reset effect listens to.
+  // Initial load when the selected conversation changes — show the loader.
   useEffect(() => {
-    if (!conversationId) return;
+    if (!conversationId) {
+      setLoading(false);
+      return;
+    }
 
-    const supabase = createClient();
     let cancelled = false;
+    setLoading(true);
 
     (async () => {
-      setLoading(true);
-
-      const { data, error } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("conversation_id", conversationId)
-        .order("created_at", { ascending: true });
-
-      if (cancelled) return;
-
-      if (error) {
-        console.error("Failed to fetch messages:", error);
-      } else {
+      try {
+        const { messages: data } = await fetchJson<{ messages: Message[] }>(
+          `/api/data/messages?conversation_id=${conversationId}`,
+        );
+        if (cancelled) return;
         onMessagesLoadedRef.current(data ?? []);
+      } catch (error) {
+        console.error("Failed to fetch messages:", error);
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-
-      if (!cancelled) setLoading(false);
     })();
 
     return () => {
       cancelled = true;
     };
-    // `resyncToken` is included so the parent can force a refetch when
-    // the realtime channel reconnects or the tab regains focus —
-    // realtime is best-effort and any message events sent while the WS
-    // was disconnected or throttled are otherwise lost.
+  }, [conversationId]);
+
+  // Background refresh on poll / tab focus — no loader, keep thread visible.
+  useEffect(() => {
+    if (!conversationId || resyncToken === 0) return;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { messages: data } = await fetchJson<{ messages: Message[] }>(
+          `/api/data/messages?conversation_id=${conversationId}`,
+        );
+        if (cancelled) return;
+        onMessagesLoadedRef.current(data ?? []);
+      } catch (error) {
+        console.error("Failed to refresh messages:", error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [conversationId, resyncToken]);
 
   // Reactions fetch — pulls the current state from the DB. Kept separate
@@ -309,20 +348,18 @@ export function MessageThread({
       setReactions([]);
       return;
     }
-    const supabase = createClient();
     let cancelled = false;
 
     (async () => {
-      const { data, error } = await supabase
-        .from("message_reactions")
-        .select("*")
-        .eq("conversation_id", conversationId);
-      if (cancelled) return;
-      if (error) {
-        console.error("Failed to fetch reactions:", error);
-        return;
+      try {
+        const { reactions: data } = await fetchJson<{ reactions: MessageReaction[] }>(
+          `/api/data/message-reactions?conversation_id=${conversationId}`,
+        );
+        if (cancelled) return;
+        setReactions(data ?? []);
+      } catch (error) {
+        console.error('Failed to fetch reactions:', error);
       }
-      setReactions((data as MessageReaction[]) ?? []);
     })();
 
     return () => {
@@ -330,78 +367,7 @@ export function MessageThread({
     };
   }, [conversationId, resyncToken]);
 
-  // Reactions realtime subscription per conversation. Subscribing here
-  // (not at the page level) keeps the channel scoped to the visible
-  // conversation and avoids cross-conversation chatter on a busy inbox.
-  useEffect(() => {
-    if (!conversationId) return;
-    const supabase = createClient();
-
-    const channel = supabase
-      .channel(`reactions:${conversationId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const row = payload.new as MessageReaction;
-          setReactions((prev) => {
-            if (prev.some((r) => r.id === row.id)) return prev;
-            // Swap any matching optimistic temp row for the real one so
-            // the pill doesn't double up after a successful POST.
-            const tempIdx = prev.findIndex(
-              (r) =>
-                r.id.startsWith("temp-") &&
-                r.message_id === row.message_id &&
-                r.actor_type === row.actor_type &&
-                r.actor_id === row.actor_id,
-            );
-            if (tempIdx >= 0) {
-              const copy = prev.slice();
-              copy[tempIdx] = row;
-              return copy;
-            }
-            return [...prev, row];
-          });
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const row = payload.new as MessageReaction;
-          setReactions((prev) => prev.map((r) => (r.id === row.id ? row : r)));
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const old = payload.old as Partial<MessageReaction>;
-          if (!old?.id) return;
-          setReactions((prev) => prev.filter((r) => r.id !== old.id));
-        },
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [conversationId]);
+  // Realtime reactions subscription removed — resyncToken refetch handles updates.
 
   // Clear any in-progress reply draft when the active conversation changes —
   // a quote pulled from conversation A shouldn't bleed into conversation B.
@@ -420,14 +386,12 @@ export function MessageThread({
   // is 0 the condition is false, so no further UPDATE is issued.
   useEffect(() => {
     if (!conversationId || !hasUnread) return;
-    const supabase = createClient();
-    supabase
-      .from("conversations")
-      .update({ unread_count: 0 })
-      .eq("id", conversationId)
-      .then(({ error }) => {
-        if (error) console.error("Failed to reset unread_count:", error);
-      });
+    void fetchJson(`/api/data/conversations/${conversationId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ unread_count: 0 }),
+    }).catch((error) => {
+      console.error('Failed to reset unread_count:', error);
+    });
   }, [conversationId, hasUnread]);
 
   // Auto-scroll to bottom on new messages
@@ -565,11 +529,10 @@ export function MessageThread({
     async (status: ConversationStatus) => {
       if (!conversation) return;
 
-      const supabase = createClient();
-      await supabase
-        .from("conversations")
-        .update({ status })
-        .eq("id", conversation.id);
+      await fetchJson(`/api/data/conversations/${conversation.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      });
 
       onStatusChange(conversation.id, status);
     },
@@ -761,21 +724,94 @@ export function MessageThread({
     async (agentId: string | null) => {
       if (!conversation) return;
 
-      const supabase = createClient();
-      const { error } = await supabase
-        .from("conversations")
-        .update({ assigned_agent_id: agentId })
-        .eq("id", conversation.id);
-
-      if (error) {
-        console.error("Failed to update assignment:", error);
-        toast.error("Failed to update assignment");
-        return;
-      }
+      await fetchJson(`/api/data/conversations/${conversation.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ assigned_agent_id: agentId }),
+      });
 
       onAssignChange(conversation.id, agentId);
     },
     [conversation, onAssignChange],
+  );
+
+  const handleAiAgentChange = useCallback(
+    async (aiAgentId: string | null) => {
+      if (!conversation) return;
+
+      await fetchJson(`/api/data/conversations/${conversation.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ ai_agent_id: aiAgentId }),
+      });
+
+      onAiAgentChange?.(conversation.id, aiAgentId);
+    },
+    [conversation, onAiAgentChange],
+  );
+
+  const handleHandlingModeChange = useCallback(
+    async (mode: ConversationHandlingMode) => {
+      if (!conversation) return;
+
+      await fetchJson(`/api/data/conversations/${conversation.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ handling_mode: mode }),
+      });
+
+      onHandlingModeChange?.(conversation.id, mode);
+    },
+    [conversation, onHandlingModeChange],
+  );
+
+  const handleSendDraft = useCallback(
+    async (messageId: string) => {
+      if (!conversation || !canEdit) return;
+      const draft = messages.find((m) => m.id === messageId);
+      if (!draft?.content_text) return;
+
+      try {
+        const res = await fetch("/api/whatsapp/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversation_id: conversation.id,
+            draft_message_id: messageId,
+          }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          toast.error(payload.error || "Failed to send draft");
+          return;
+        }
+        onUpdateMessage(messageId, { status: "sent" });
+        toast.success("Draft sent");
+      } catch (err) {
+        console.error("[MessageThread] send draft error:", err);
+        toast.error("Could not reach the server");
+      }
+    },
+    [conversation, canEdit, messages, onUpdateMessage],
+  );
+
+  const handleDiscardDraft = useCallback(
+    async (messageId: string) => {
+      if (!canEdit) return;
+      try {
+        const res = await fetch(`/api/data/messages/${messageId}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          toast.error(payload.error || "Failed to discard draft");
+          return;
+        }
+        onMessagesLoaded(messages.filter((m) => m.id !== messageId));
+        toast.success("Draft discarded");
+      } catch (err) {
+        console.error("[MessageThread] discard draft error:", err);
+        toast.error("Could not reach the server");
+      }
+    },
+    [canEdit, messages, onMessagesLoaded],
   );
 
   // Empty state — same WhatsApp-style doodle background as the active
@@ -807,6 +843,10 @@ export function MessageThread({
   const assignLabel = assignedAgentId
     ? (currentAssignee?.full_name ?? "Assigned")
     : "Assign";
+  const aiAgentId = conversation.ai_agent_id ?? null;
+  const connectedAiAgent = aiAgents.find((a) => a.id === aiAgentId);
+  const aiAgentLabel = connectedAiAgent?.name ?? "AI agent";
+  const handlingMode = conversation.handling_mode ?? "AGENT";
 
   return (
     // `min-w-0` is load-bearing: the page already puts min-w-0 on the
@@ -927,6 +967,102 @@ export function MessageThread({
                   {opt.label}
                 </DropdownMenuItem>
               ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* AI handling mode */}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className={cn(
+                "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                handlingMode === "AGENT" ? "text-primary" : "text-muted-foreground",
+              )}
+            >
+              <Bot className="h-3 w-3" />
+              <span className="hidden sm:inline">
+                {handlingMode === "AGENT" ? "AI on" : "Human"}
+              </span>
+              <ChevronDown className="h-3 w-3" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="border-border bg-popover">
+              <DropdownMenuItem
+                disabled={!canEdit}
+                onClick={() => void handleHandlingModeChange("AGENT")}
+                className={cn(
+                  "text-sm",
+                  handlingMode === "AGENT" ? "text-primary" : "",
+                )}
+              >
+                AI agent handles replies
+                {handlingMode === "AGENT" && <Check className="ml-auto h-3 w-3" />}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={!canEdit}
+                onClick={() => void handleHandlingModeChange("HUMAN")}
+                className={cn(
+                  "text-sm",
+                  handlingMode === "HUMAN" ? "text-primary" : "",
+                )}
+              >
+                Human only
+                {handlingMode === "HUMAN" && <Check className="ml-auto h-3 w-3" />}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* AI agent connect */}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className={cn(
+                "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted max-w-[120px]",
+                aiAgentId ? "text-primary" : "text-muted-foreground",
+              )}
+            >
+              <Bot className="h-3 w-3 shrink-0" />
+              <span className="hidden truncate sm:inline">{aiAgentLabel}</span>
+              <ChevronDown className="h-3 w-3 shrink-0" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="border-border bg-popover">
+              {aiAgents.length === 0 ? (
+                <DropdownMenuItem disabled className="text-sm text-muted-foreground">
+                  No agents configured
+                </DropdownMenuItem>
+              ) : (
+                aiAgents.map((agent) => {
+                  const isSelected = agent.id === aiAgentId;
+                  return (
+                    <DropdownMenuItem
+                      key={agent.id}
+                      disabled={!canEdit}
+                      onClick={() => void handleAiAgentChange(agent.id)}
+                      className={cn(
+                        "text-sm",
+                        isSelected ? "text-primary" : "text-popover-foreground",
+                      )}
+                    >
+                      <span className="flex-1 truncate">{agent.name}</span>
+                      {!agent.is_active && (
+                        <span className="ml-2 text-[10px] text-muted-foreground">
+                          inactive
+                        </span>
+                      )}
+                      {isSelected && <Check className="ml-2 h-3 w-3" />}
+                    </DropdownMenuItem>
+                  );
+                })
+              )}
+              {aiAgentId && (
+                <>
+                  <DropdownMenuSeparator className="bg-border" />
+                  <DropdownMenuItem
+                    disabled={!canEdit}
+                    onClick={() => void handleAiAgentChange(null)}
+                    className="text-sm text-muted-foreground"
+                  >
+                    Disconnect AI agent
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
 
@@ -1059,6 +1195,9 @@ export function MessageThread({
                           reactions={msgReactions}
                           currentUserId={user?.id}
                           onToggleReaction={handlePillToggle}
+                          onSendDraft={handleSendDraft}
+                          onDiscardDraft={handleDiscardDraft}
+                          canActOnDraft={canEdit}
                         />
                       </MessageActions>
                     );

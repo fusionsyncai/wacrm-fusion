@@ -148,6 +148,12 @@ export const RATE_LIMITS = {
    *  instance deploy needs the Redis swap described at the top of
    *  this file (the per-key call sites don't change). */
   publicApi: { limit: 120, windowMs: 60_000 },
+  /** Signup OTP send — per email. */
+  signupOtp: { limit: 5, windowMs: 15 * 60_000 },
+  /** Signup OTP send — per IP (covers many emails from one client). */
+  signupOtpIp: { limit: 20, windowMs: 15 * 60_000 },
+  /** Signup OTP verify attempts — per email. */
+  signupVerify: { limit: 10, windowMs: 15 * 60_000 },
 } as const;
 
 /** Test-only helper. Clears the in-memory state so unit tests don't

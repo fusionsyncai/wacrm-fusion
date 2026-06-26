@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { createClient } from "@/lib/supabase/client";
+import { fetchJson } from "@/lib/api/fetch-json";
 import type { Pipeline, PipelineStage, Deal } from "@/types";
 import { PipelineBoard } from "@/components/pipelines/pipeline-board";
 import { PipelineSettings } from "@/components/pipelines/pipeline-settings";
@@ -30,22 +30,17 @@ import { useCan } from "@/hooks/use-can";
 import { useAuth } from "@/hooks/use-auth";
 import { GatedButton } from "@/components/ui/gated-button";
 
-// Pipeline creation is admin-class (settings-tier write under
-// the new RLS); deal creation is operational and only requires
-// agent+. The two CTAs gate on different `useCan` capabilities,
-// not on different copy.
+type PipelineWithStages = Pipeline & { stages?: PipelineStage[] };
 
-// Spec-defined seed — name and color per the product spec.
 const SPEC_DEFAULT_STAGES = [
-  { name: "New Lead", color: "#3b82f6", position: 0 }, // blue
-  { name: "Qualified", color: "#eab308", position: 1 }, // yellow
-  { name: "Proposal Sent", color: "#f97316", position: 2 }, // orange
-  { name: "Negotiation", color: "#8b5cf6", position: 3 }, // purple
-  { name: "Won", color: "#22c55e", position: 4 }, // green
+  { name: "New Lead", color: "#3b82f6", position: 0 },
+  { name: "Qualified", color: "#eab308", position: 1 },
+  { name: "Proposal Sent", color: "#f97316", position: 2 },
+  { name: "Negotiation", color: "#8b5cf6", position: 3 },
+  { name: "Won", color: "#22c55e", position: 4 },
 ];
 
 export default function PipelinesPage() {
-  const supabase = createClient();
   const canEditSettings = useCan("edit-settings");
   const canCreateDeals = useCan("send-messages");
   const { accountId } = useAuth();
@@ -56,89 +51,85 @@ export default function PipelinesPage() {
   const [deals, setDeals] = useState<Deal[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Dialog / sheet state
   const [newPipelineOpen, setNewPipelineOpen] = useState(false);
   const [newPipelineName, setNewPipelineName] = useState("");
   const [creating, setCreating] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  // Deal form state is lifted here so both the top-bar "Add Deal" and
-  // the per-column "+" trigger the same Sheet.
   const [dealFormOpen, setDealFormOpen] = useState(false);
   const [editingDeal, setEditingDeal] = useState<Deal | null>(null);
   const [defaultStageId, setDefaultStageId] = useState<string>("");
 
-  // Guard against double-seeding (React StrictMode double-effect in dev).
   const seedAttempted = useRef(false);
 
-  const loadPipelines = useCallback(async () => {
-    const { data, error } = await supabase
-      .from("pipelines")
-      .select("*")
-      .order("created_at");
-    if (error) {
-      console.error("Failed to load pipelines:", error.message);
+  const loadPipelines = useCallback(async (): Promise<PipelineWithStages[]> => {
+    try {
+      const { pipelines: data } = await fetchJson<{ pipelines: PipelineWithStages[] }>(
+        "/api/data/pipelines",
+      );
+      return data ?? [];
+    } catch (err) {
+      console.error("Failed to load pipelines:", err);
       return [];
     }
-    return data ?? [];
-  }, [supabase]);
+  }, []);
 
-  const loadStages = useCallback(
-    async (pipelineId: string) => {
-      const { data } = await supabase
-        .from("pipeline_stages")
-        .select("*")
-        .eq("pipeline_id", pipelineId)
-        .order("position");
+  const loadStages = useCallback(async (pipelineId: string) => {
+    const list = await loadPipelines();
+    const pipeline = list.find((p) => p.id === pipelineId);
+    return pipeline?.stages ?? [];
+  }, [loadPipelines]);
+
+  const loadDeals = useCallback(async (pipelineId: string) => {
+    try {
+      const { deals: data } = await fetchJson<{ deals: Deal[] }>(
+        `/api/data/deals?pipeline_id=${pipelineId}`,
+      );
       return data ?? [];
-    },
-    [supabase],
-  );
+    } catch (err) {
+      console.error("Failed to load deals:", err);
+      return [];
+    }
+  }, []);
 
-  const loadDeals = useCallback(
-    async (pipelineId: string) => {
-      const { data } = await supabase
-        .from("deals")
-        .select("*, contact:contacts(*), assignee:profiles!deals_assigned_to_fkey(*)")
-        .eq("pipeline_id", pipelineId)
-        .order("created_at", { ascending: false });
-      return (data ?? []) as Deal[];
+  const createPipelineWithDefaultStages = useCallback(
+    async (name: string): Promise<Pipeline | null> => {
+      if (!accountId) return null;
+
+      try {
+        const { pipeline } = await fetchJson<{ pipeline: Pipeline }>(
+          "/api/data/pipelines",
+          {
+            method: "POST",
+            body: JSON.stringify({ name }),
+          },
+        );
+
+        await fetchJson("/api/data/pipeline-stages", {
+          method: "POST",
+          body: JSON.stringify({
+            stages: SPEC_DEFAULT_STAGES.map((s) => ({
+              pipeline_id: pipeline.id,
+              name: s.name,
+              color: s.color,
+              position: s.position,
+            })),
+          }),
+        });
+
+        return pipeline;
+      } catch (err) {
+        console.error("Failed to create pipeline:", err);
+        return null;
+      }
     },
-    [supabase],
+    [accountId],
   );
 
   const seedDefaultPipeline = useCallback(async (): Promise<Pipeline | null> => {
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) return null;
-    // pipelines.account_id is NOT NULL post-017 with no DB default.
-    if (!accountId) return null;
+    return createPipelineWithDefaultStages("Sales Pipeline");
+  }, [createPipelineWithDefaultStages]);
 
-    const { data: pipeline, error } = await supabase
-      .from("pipelines")
-      .insert({ user_id: user.id, account_id: accountId, name: "Sales Pipeline" })
-      .select()
-      .single();
-
-    if (error || !pipeline) {
-      console.error("Failed to seed pipeline:", error?.message);
-      return null;
-    }
-
-    const stagesPayload = SPEC_DEFAULT_STAGES.map((s) => ({
-      pipeline_id: pipeline.id,
-      name: s.name,
-      color: s.color,
-      position: s.position,
-    }));
-    await supabase.from("pipeline_stages").insert(stagesPayload);
-
-    return pipeline as Pipeline;
-  }, [supabase, accountId]);
-
-  // Initial load + seed-if-empty
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -167,10 +158,6 @@ export default function PipelinesPage() {
     };
   }, [loadPipelines, seedDefaultPipeline]);
 
-  // Load stages + deals whenever selected pipeline changes.
-  // Clearing on no-selection is a legitimate sync with URL/prop
-  // state; the load completion uses async setters inside promise
-  // callbacks (not synchronous in the effect body).
   useEffect(() => {
     if (!selectedPipelineId) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -214,20 +201,20 @@ export default function PipelinesPage() {
 
   const handleDealMoved = useCallback(
     async (dealId: string, newStageId: string) => {
-      // Optimistic update — board already animated; just persist.
       setDeals((prev) =>
         prev.map((d) => (d.id === dealId ? { ...d, stage_id: newStageId } : d)),
       );
-      const { error } = await supabase
-        .from("deals")
-        .update({ stage_id: newStageId })
-        .eq("id", dealId);
-      if (error) {
+      try {
+        await fetchJson(`/api/data/deals/${dealId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ stage_id: newStageId }),
+        });
+      } catch {
         toast.error("Failed to move deal");
         refreshDeals();
       }
     },
-    [supabase, refreshDeals],
+    [refreshDeals],
   );
 
   const handleAddDeal = useCallback(
@@ -250,40 +237,18 @@ export default function PipelinesPage() {
     if (!name) return;
     setCreating(true);
 
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) {
-      setCreating(false);
-      return;
-    }
-    // pipelines.account_id is NOT NULL post-017 with no DB default.
     if (!accountId) {
       toast.error("Your profile is not linked to an account.");
       setCreating(false);
       return;
     }
 
-    const { data: pipeline, error } = await supabase
-      .from("pipelines")
-      .insert({ user_id: user.id, account_id: accountId, name })
-      .select()
-      .single();
-
-    if (error || !pipeline) {
+    const pipeline = await createPipelineWithDefaultStages(name);
+    if (!pipeline) {
       toast.error("Failed to create pipeline");
       setCreating(false);
       return;
     }
-
-    const stagesPayload = SPEC_DEFAULT_STAGES.map((s) => ({
-      pipeline_id: pipeline.id,
-      name: s.name,
-      color: s.color,
-      position: s.position,
-    }));
-    await supabase.from("pipeline_stages").insert(stagesPayload);
 
     setNewPipelineName("");
     setNewPipelineOpen(false);
@@ -313,10 +278,8 @@ export default function PipelinesPage() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          {/* Pipeline selector dropdown */}
           <DropdownMenu>
             <DropdownMenuTrigger
               className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm text-foreground hover:bg-muted transition-colors data-[popup-open]:bg-muted"
@@ -388,7 +351,6 @@ export default function PipelinesPage() {
         </div>
       </div>
 
-      {/* Board */}
       {pipelines.length === 0 ? (
         <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border py-20">
           <GitBranch className="h-12 w-12 text-muted-foreground" />
@@ -421,7 +383,6 @@ export default function PipelinesPage() {
         </>
       )}
 
-      {/* New Pipeline Dialog */}
       <Dialog open={newPipelineOpen} onOpenChange={setNewPipelineOpen}>
         <DialogContent className="sm:max-w-sm bg-popover border-border">
           <DialogHeader>
@@ -461,7 +422,6 @@ export default function PipelinesPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Pipeline Settings */}
       {selectedPipeline && (
         <PipelineSettings
           open={settingsOpen}
@@ -477,7 +437,6 @@ export default function PipelinesPage() {
         />
       )}
 
-      {/* Deal Form (Sheet) */}
       <DealForm
         open={dealFormOpen}
         onOpenChange={setDealFormOpen}

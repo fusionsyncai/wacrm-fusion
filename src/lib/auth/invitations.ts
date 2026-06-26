@@ -25,6 +25,10 @@
 
 import { createHash, randomBytes } from "node:crypto";
 
+import type { AccountRole } from "@/generated/prisma/client";
+import { SqlStateError } from "@/lib/db/sql-state-error";
+import { prisma } from "@/lib/prisma";
+
 /** Default invite link lifetime if the caller doesn't specify. */
 export const DEFAULT_INVITE_EXPIRY_DAYS = 7;
 
@@ -98,4 +102,139 @@ export function clampExpiryDays(expiresInDays: number | undefined): number {
     return DEFAULT_INVITE_EXPIRY_DAYS;
   }
   return Math.min(Math.floor(expiresInDays), MAX_INVITE_EXPIRY_DAYS);
+}
+
+export type PeekInvitationResult =
+  | { ok: true; account_name: string | null; role: AccountRole; expires_at: string }
+  | { ok: false; reason: "not_found" | "expired" | "used" };
+
+/** Anonymous invite preview — mirrors `peek_invitation` RPC. */
+export async function peekInvitation(
+  tokenHash: string,
+): Promise<PeekInvitationResult> {
+  const inv = await prisma.accountInvitation.findUnique({
+    where: { tokenHash },
+    include: { account: { select: { name: true } } },
+  });
+
+  if (!inv) return { ok: false, reason: "not_found" };
+  if (inv.acceptedAt) return { ok: false, reason: "used" };
+  if (inv.expiresAt <= new Date()) return { ok: false, reason: "expired" };
+
+  return {
+    ok: true,
+    account_name: inv.account.name,
+    role: inv.role,
+    expires_at: inv.expiresAt.toISOString(),
+  };
+}
+
+async function accountHasDomainData(accountId: string): Promise<boolean> {
+  const checks = await Promise.all([
+    prisma.contact.count({ where: { accountId } }),
+    prisma.conversation.count({ where: { accountId } }),
+    prisma.broadcast.count({ where: { accountId } }),
+    prisma.automation.count({ where: { accountId } }),
+    prisma.flow.count({ where: { accountId } }),
+    prisma.pipeline.count({ where: { accountId } }),
+    prisma.messageTemplate.count({ where: { accountId } }),
+    prisma.tag.count({ where: { accountId } }),
+    prisma.customField.count({ where: { accountId } }),
+    prisma.contactNote.count({ where: { accountId } }),
+    prisma.whatsappConfig.count({ where: { accountId } }),
+  ]);
+  return checks.some((n) => n > 0);
+}
+
+/** Authenticated invite redeem — mirrors `redeem_invitation` RPC. */
+export async function redeemInvitation(
+  callerUserId: string,
+  tokenHash: string,
+): Promise<string> {
+  return prisma.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<
+      Array<{
+        id: string;
+        account_id: string;
+        role: AccountRole;
+        accepted_at: Date | null;
+        expires_at: Date;
+      }>
+    >`
+      SELECT id, account_id, role, accepted_at, expires_at
+      FROM account_invitations
+      WHERE token_hash = ${tokenHash}
+      FOR UPDATE
+    `;
+
+    const inv = rows[0];
+    if (!inv) {
+      throw new SqlStateError("Invitation not found", "22023");
+    }
+    if (inv.accepted_at) {
+      throw new SqlStateError("Invitation has already been redeemed", "22023");
+    }
+    if (inv.expires_at <= new Date()) {
+      throw new SqlStateError("Invitation has expired", "22023");
+    }
+
+    const profile = await tx.profile.findUnique({
+      where: { userId: callerUserId },
+      select: { accountId: true },
+    });
+    if (!profile?.accountId) {
+      throw new SqlStateError("Caller has no profile", "42501");
+    }
+
+    const account = await tx.account.findUnique({
+      where: { id: profile.accountId },
+      select: { ownerUserId: true },
+    });
+    if (!account) {
+      throw new SqlStateError("Caller has no profile", "42501");
+    }
+
+    const oldAccountId = profile.accountId;
+
+    if (oldAccountId === inv.account_id) {
+      throw new SqlStateError(
+        "You are already a member of this account",
+        "23505",
+      );
+    }
+
+    if (account.ownerUserId !== callerUserId) {
+      throw new SqlStateError(
+        "You are already in a shared account; sign up with a different email to join this one",
+        "23505",
+      );
+    }
+
+    if (await accountHasDomainData(oldAccountId)) {
+      throw new SqlStateError(
+        "Your account already contains data; sign up with a different email to join this one",
+        "23505",
+      );
+    }
+
+    await tx.profile.update({
+      where: { userId: callerUserId },
+      data: {
+        accountId: inv.account_id,
+        accountRole: inv.role,
+      },
+    });
+
+    await tx.accountInvitation.update({
+      where: { id: inv.id },
+      data: {
+        acceptedAt: new Date(),
+        acceptedByUserId: callerUserId,
+      },
+    });
+
+    await tx.account.delete({ where: { id: oldAccountId } });
+
+    return inv.account_id;
+  });
 }

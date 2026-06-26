@@ -18,7 +18,7 @@ import {
   Loader2,
 } from "lucide-react"
 
-import { createClient } from "@/lib/supabase/client"
+import { fetchJson } from "@/lib/api/fetch-json"
 import { useCan } from "@/hooks/use-can"
 import type { Automation } from "@/types"
 import { Button } from "@/components/ui/button"
@@ -67,13 +67,10 @@ export default function AutomationsPage() {
 
   async function load() {
     try {
-      const supabase = createClient()
-      const { data, error: fetchErr } = await supabase
-        .from("automations")
-        .select("*")
-        .order("created_at", { ascending: false })
-      if (fetchErr) throw fetchErr
-      setAutomations((data ?? []) as Automation[])
+      const { automations: data } = await fetchJson<{ automations: Automation[] }>(
+        "/api/automations",
+      )
+      setAutomations(data ?? [])
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load automations")
     }

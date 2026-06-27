@@ -213,39 +213,50 @@ export function AgentDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>{isEdit ? "Edit agent" : "New agent"}</DialogTitle>
+      <DialogContent className="flex max-h-[90vh] w-full max-w-4xl flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
+        <DialogHeader className="shrink-0 border-b border-border px-6 py-5">
+          <DialogTitle className="text-lg">
+            {isEdit ? "Edit agent" : "New agent"}
+          </DialogTitle>
           <DialogDescription>
             Configure prompt, tools, and reply behavior for this AI assistant.
           </DialogDescription>
         </DialogHeader>
 
-        <Tabs value={tab} onValueChange={setTab}>
-          <TabsList className="w-full">
-            <TabsTrigger value="prompt">Prompt</TabsTrigger>
-            <TabsTrigger value="tools">Tools</TabsTrigger>
-            <TabsTrigger value="settings">Settings</TabsTrigger>
-          </TabsList>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+          <Tabs value={tab} onValueChange={setTab} className="flex flex-col gap-5">
+            <TabsList className="h-10 w-full justify-start">
+              <TabsTrigger value="prompt" className="flex-1 sm:flex-none sm:px-6">
+                Prompt
+              </TabsTrigger>
+              <TabsTrigger value="tools" className="flex-1 sm:flex-none sm:px-6">
+                Tools
+              </TabsTrigger>
+              <TabsTrigger value="settings" className="flex-1 sm:flex-none sm:px-6">
+                Settings
+              </TabsTrigger>
+            </TabsList>
 
-          <TabsContent value="prompt" className="mt-4 space-y-4">
-            <div className="grid gap-2">
-              <Label htmlFor="agent-name">Name</Label>
-              <Input
-                id="agent-name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Support bot"
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="agent-description">Description (optional)</Label>
-              <Input
-                id="agent-description"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="Handles tier-1 support questions"
-              />
+          <TabsContent value="prompt" className="mt-0 space-y-5">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div className="grid gap-2">
+                <Label htmlFor="agent-name">Name</Label>
+                <Input
+                  id="agent-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Support bot"
+                />
+              </div>
+              <div className="grid gap-2 sm:col-span-2">
+                <Label htmlFor="agent-description">Description (optional)</Label>
+                <Input
+                  id="agent-description"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Handles tier-1 support questions"
+                />
+              </div>
             </div>
             <div className="grid gap-2">
               <Label htmlFor="agent-prompt">System prompt</Label>
@@ -253,22 +264,28 @@ export function AgentDialog({
                 id="agent-prompt"
                 value={systemPrompt}
                 onChange={(e) => setSystemPrompt(e.target.value)}
-                rows={8}
+                rows={10}
+                className="min-h-[240px] resize-y font-mono text-sm leading-relaxed"
                 placeholder="You are a helpful assistant…"
               />
+              <p className="text-xs text-muted-foreground">
+                Instructions the model follows for every conversation with this agent.
+              </p>
             </div>
           </TabsContent>
 
-          <TabsContent value="tools" className="mt-4 space-y-4">
+          <TabsContent value="tools" className="mt-0 space-y-4">
             {tools.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                No tools yet. Add tools the model can call during conversations.
-              </p>
+              <div className="rounded-lg border border-dashed border-border bg-muted/20 px-4 py-8 text-center">
+                <p className="text-sm text-muted-foreground">
+                  No tools yet. Add tools the model can call during conversations.
+                </p>
+              </div>
             ) : (
               tools.map((tool, toolIndex) => (
                 <div
                   key={tool.id ?? toolIndex}
-                  className="space-y-3 rounded-lg border border-border p-3"
+                  className="space-y-4 rounded-lg border border-border bg-muted/10 p-4"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-medium text-muted-foreground">
@@ -300,13 +317,15 @@ export function AgentDialog({
                     </div>
                     <div className="grid gap-1 sm:col-span-2">
                       <Label>Description</Label>
-                      <Input
+                      <Textarea
                         value={tool.description}
                         onChange={(e) =>
                           updateTool(toolIndex, {
                             description: e.target.value,
                           })
                         }
+                        rows={2}
+                        className="min-h-18 resize-y"
                         placeholder="Get weather for a city"
                       />
                     </div>
@@ -401,33 +420,33 @@ export function AgentDialog({
             </Button>
           </TabsContent>
 
-          <TabsContent value="settings" className="mt-4 space-y-4">
-            <div className="flex items-center justify-between rounded-lg border border-border p-3">
-              <div>
+          <TabsContent value="settings" className="mt-0 space-y-4">
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/10 p-4">
+              <div className="space-y-1">
                 <p className="text-sm font-medium">Active</p>
-                <p className="text-xs text-muted-foreground">
+                <p className="text-xs leading-relaxed text-muted-foreground">
                   Inactive agents never reply, even when connected.
                 </p>
               </div>
               <Switch checked={isActive} onCheckedChange={setIsActive} />
             </div>
-            <div className="flex items-center justify-between rounded-lg border border-border p-3">
-              <div>
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/10 p-4">
+              <div className="space-y-1">
                 <p className="text-sm font-medium">Auto-connect</p>
-                <p className="text-xs text-muted-foreground">
+                <p className="text-xs leading-relaxed text-muted-foreground">
                   Attach this agent to new conversations on first inbound
                   message. Only one agent per account can auto-connect.
                 </p>
               </div>
               <Switch checked={autoConnect} onCheckedChange={setAutoConnect} />
             </div>
-            <div className="grid gap-2">
+            <div className="grid gap-2 rounded-lg border border-border bg-muted/10 p-4">
               <Label>Reply mode</Label>
               <Select
                 value={replyMode}
                 onValueChange={(v) => setReplyMode(v as AgentReplyMode)}
               >
-                <SelectTrigger>
+                <SelectTrigger className="w-full sm:max-w-md">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -442,8 +461,9 @@ export function AgentDialog({
             </div>
           </TabsContent>
         </Tabs>
+        </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0 border-t border-border px-6 py-4">
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>

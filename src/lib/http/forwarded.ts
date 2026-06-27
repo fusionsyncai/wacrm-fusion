@@ -3,6 +3,8 @@
  * send comma-separated values like `x-forwarded-proto: https, https`.
  * Always take the left-most (client-facing) value.
  */
+import { normalizeAuthUrl } from "@/lib/env/ensure-auth-url";
+
 export function firstHeaderValue(
   value: string | null | undefined,
 ): string | undefined {
@@ -30,12 +32,20 @@ export function safeRequestUrl(request: Request): URL {
   try {
     return new URL(request.url);
   } catch {
-    const configured = process.env.AUTH_URL?.trim().replace(/\/+$/, "");
+    const configured =
+      normalizeAuthUrl(process.env.AUTH_URL) ??
+      normalizeAuthUrl(
+        process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined,
+      );
     const origin = configured ?? requestOrigin(request) ?? "http://localhost:3000";
 
     const apiPath = request.url.match(/(\/api\/[^\s]*)/)?.[1];
     const pathAndQuery = apiPath ?? "/";
 
-    return new URL(pathAndQuery, origin);
+    try {
+      return new URL(pathAndQuery, origin);
+    } catch {
+      return new URL(pathAndQuery, "http://localhost:3000");
+    }
   }
 }

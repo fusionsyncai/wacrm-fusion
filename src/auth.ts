@@ -6,7 +6,10 @@ import { z } from "zod";
 
 import { authConfig } from "@/auth.config";
 import type { AccountRole } from "@/generated/prisma/client";
+import { ensureAuthUrlEnv } from "@/lib/env/ensure-auth-url";
 import { prisma } from "@/lib/prisma";
+
+ensureAuthUrlEnv();
 
 const credentialsSchema = z.object({
   email: z.string().email(),

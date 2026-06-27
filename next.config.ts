@@ -56,6 +56,9 @@ const SECURITY_HEADERS = [
 ] as const;
 
 const nextConfig: NextConfig = {
+  
+  allowedDevOrigins: ['deservedly-underaccommodated-maryrose.ngrok-free.dev'],
+  
   serverExternalPackages: ["@prisma/client", "@prisma/adapter-pg", "pg"],
   /**
    * Cache-Control policy.

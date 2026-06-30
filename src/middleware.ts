@@ -79,6 +79,6 @@ export default auth((req) => {
 
 export const config = {
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|api/whatsapp/webhook|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    "/((?!_next/static|_next/image|favicon.ico|api/whatsapp/webhook|api/voice/sessions/.+/events|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
 };

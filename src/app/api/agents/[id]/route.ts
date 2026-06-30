@@ -56,6 +56,15 @@ export async function PATCH(request: Request, { params }: RouteParams) {
         body.auto_connect !== undefined ? body.auto_connect : existing.autoConnect,
       is_active:
         body.is_active !== undefined ? body.is_active : existing.isActive,
+      voice_enabled:
+        body.voice_enabled !== undefined
+          ? body.voice_enabled
+          : existing.voiceEnabled,
+      voice_id: body.voice_id !== undefined ? body.voice_id : existing.voiceId,
+      call_summary_prompt:
+        body.call_summary_prompt !== undefined
+          ? body.call_summary_prompt
+          : existing.callSummaryPrompt,
     });
     if (!parsed.ok) {
       return NextResponse.json({ error: parsed.error }, { status: 400 });

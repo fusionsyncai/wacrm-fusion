@@ -10,6 +10,7 @@ import {
   Tags,
   User,
   UsersRound,
+  Mic,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -33,6 +34,7 @@ export const SETTINGS_SECTIONS = [
   'members',
   'api',
   'ai',
+  'livekit',
 ] as const;
 
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
@@ -59,6 +61,7 @@ export const SECTION_META: Record<SettingsSection, SectionMeta> = {
   members: { id: 'members', label: 'Team members', icon: UsersRound, group: 'workspace' },
   api: { id: 'api', label: 'API keys', icon: KeyRound, group: 'workspace' },
   ai: { id: 'ai', label: 'AI & LLM', icon: Bot, group: 'workspace' },
+  livekit: { id: 'livekit', label: 'LiveKit voice', icon: Mic, group: 'workspace' },
 };
 
 export const RAIL_GROUPS: { label: string | null; group: SectionMeta['group'] }[] = [

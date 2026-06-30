@@ -14,6 +14,13 @@ import {
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
 import { runAgentForInbound } from '@/lib/agents/engine'
+import { handleInboundWhatsAppCall } from '@/lib/voice/handle-inbound-call'
+import { handleTerminateWhatsAppCall } from '@/lib/voice/handle-call-terminate'
+import {
+  isConnectCallEvent,
+  isTerminateCallEvent,
+  parseInboundCallEvents,
+} from '@/lib/voice/whatsapp-call-webhook'
 
 interface WhatsAppMessage {
   id: string
@@ -173,8 +180,41 @@ export async function POST(request: Request) {
   return NextResponse.json({ status: 'received' }, { status: 200 })
 }
 
-async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
+async function processWebhook(body: { entry?: WhatsAppWebhookEntry[]; object?: string }) {
   if (!body.entry) return
+
+  const callEvents = parseInboundCallEvents(body)
+  if (callEvents.length > 0) {
+    console.info(
+      '[voice] webhook received call events',
+      callEvents.map((e) => ({
+        event: e.event,
+        callId: e.callId,
+        from: e.fromWaId,
+        phoneNumberId: e.phoneNumberId,
+        hasSdp: !!e.session?.sdp,
+      })),
+    )
+  }
+  for (const callEvent of callEvents) {
+    if (isConnectCallEvent(callEvent)) {
+      console.info('[voice] routing connect event', {
+        callId: callEvent.callId,
+        from: callEvent.fromWaId,
+      })
+      await handleInboundWhatsAppCall(callEvent)
+    } else if (isTerminateCallEvent(callEvent)) {
+      console.info('[voice] routing terminate event', {
+        callId: callEvent.callId,
+      })
+      await handleTerminateWhatsAppCall(callEvent)
+    } else {
+      console.info('[voice] skipping unhandled call event', {
+        event: callEvent.event,
+        callId: callEvent.callId,
+      })
+    }
+  }
 
   for (const entry of body.entry) {
     for (const change of entry.changes) {

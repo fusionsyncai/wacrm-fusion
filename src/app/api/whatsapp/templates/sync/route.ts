@@ -3,6 +3,11 @@ import type { Prisma } from '@/generated/prisma/client'
 import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account'
 import { prisma } from '@/lib/prisma'
 import { decrypt } from '@/lib/whatsapp/encryption'
+import {
+  listMessageTemplates,
+  resolveWabaId,
+  type MetaTemplateListItem,
+} from '@/lib/whatsapp/meta-api'
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
 import type { TemplateButton, TemplateSampleValues } from '@/types'
 
@@ -18,9 +23,6 @@ import type { TemplateButton, TemplateSampleValues } from '@/types'
  * Locally-created templates (no Meta counterpart) are NOT deleted —
  * they remain visible so the user can notice drift and clean up.
  */
-
-const META_API_VERSION = 'v21.0'
-const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
 interface MetaButton {
   type: string
@@ -42,16 +44,6 @@ interface MetaTemplateComponent {
   }
 }
 
-interface MetaTemplate {
-  id: string
-  name: string
-  language: string
-  status: string
-  category: string
-  components?: MetaTemplateComponent[]
-  quality_score?: { score?: string } | string
-}
-
 function normalizeCategory(
   meta: string,
 ): 'Marketing' | 'Utility' | 'Authentication' {
@@ -62,7 +54,7 @@ function normalizeCategory(
 }
 
 function normalizeQualityScore(
-  raw: MetaTemplate['quality_score'],
+  raw: MetaTemplateListItem['quality_score'],
 ): 'GREEN' | 'YELLOW' | 'RED' | null {
   const score =
     typeof raw === 'string' ? raw : raw?.score ? String(raw.score) : null
@@ -144,11 +136,11 @@ export async function POST() {
       )
     }
 
-    if (!config.wabaId) {
+    if (!config.phoneNumberId) {
       return NextResponse.json(
         {
           error:
-            'WABA (WhatsApp Business Account) ID missing. Re-connect your account in Settings.',
+            'Phone Number ID missing. Re-connect your WhatsApp account in Settings.',
         },
         { status: 400 },
       )
@@ -156,36 +148,36 @@ export async function POST() {
 
     const accessToken = decrypt(config.accessToken)
 
-    const metaTemplates: MetaTemplate[] = []
-    let nextUrl:
-      | string
-      | null = `${META_API_BASE}/${config.wabaId}/message_templates?limit=100&fields=id,name,language,status,category,components,quality_score`
-    const PAGE_CAP = 20
-    let pageCount = 0
-
-    while (nextUrl && pageCount < PAGE_CAP) {
-      pageCount++
-      const metaRes: Response = await fetch(nextUrl, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+    let wabaId: string
+    try {
+      wabaId = await resolveWabaId({
+        phoneNumberId: config.phoneNumberId,
+        accessToken,
+        storedWabaId: config.wabaId,
       })
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Could not resolve WABA ID'
+      return NextResponse.json({ error: message }, { status: 502 })
+    }
 
-      if (!metaRes.ok) {
-        let metaErr = `Meta API error: ${metaRes.status}`
-        try {
-          const body = await metaRes.json()
-          if (body?.error?.message) metaErr = body.error.message
-        } catch {
-          // response wasn't JSON — keep the fallback
-        }
-        return NextResponse.json({ error: metaErr }, { status: 502 })
-      }
+    if (wabaId !== config.wabaId) {
+      await prisma.whatsappConfig.update({
+        where: { accountId },
+        data: { wabaId },
+      })
+    }
 
-      const metaBody: {
-        data?: MetaTemplate[]
-        paging?: { next?: string }
-      } = await metaRes.json()
-      if (metaBody.data) metaTemplates.push(...metaBody.data)
-      nextUrl = metaBody.paging?.next ?? null
+    let metaTemplates: MetaTemplateListItem[] = []
+    let truncated = false
+    try {
+      const listed = await listMessageTemplates({ wabaId, accessToken })
+      metaTemplates = listed.templates
+      truncated = listed.truncated
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Meta template sync failed'
+      return NextResponse.json({ error: message }, { status: 502 })
     }
 
     let inserted = 0
@@ -263,7 +255,7 @@ export async function POST() {
       inserted,
       updated,
       errors,
-      truncated: pageCount >= PAGE_CAP && nextUrl !== null,
+      truncated,
     })
   } catch (error) {
     if (

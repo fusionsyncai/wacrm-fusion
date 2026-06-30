@@ -67,6 +67,9 @@ export function AgentDialog({
   const [replyMode, setReplyMode] = useState<AgentReplyMode>("HUMAN");
   const [autoConnect, setAutoConnect] = useState(false);
   const [isActive, setIsActive] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceId, setVoiceId] = useState("");
+  const [callSummaryPrompt, setCallSummaryPrompt] = useState("");
   const [tools, setTools] = useState<
     Array<{
       id?: string;
@@ -86,6 +89,9 @@ export function AgentDialog({
       setReplyMode(agent.reply_mode);
       setAutoConnect(agent.auto_connect);
       setIsActive(agent.is_active);
+      setVoiceEnabled(agent.voice_enabled);
+      setVoiceId(agent.voice_id ?? "");
+      setCallSummaryPrompt(agent.call_summary_prompt ?? "");
       setTools(
         agent.tools?.map((t) => ({
           id: t.id,
@@ -102,6 +108,9 @@ export function AgentDialog({
       setReplyMode("HUMAN");
       setAutoConnect(false);
       setIsActive(false);
+      setVoiceEnabled(false);
+      setVoiceId("");
+      setCallSummaryPrompt("");
       setTools([]);
     }
   }, [open, agent]);
@@ -152,6 +161,9 @@ export function AgentDialog({
         reply_mode: replyMode,
         auto_connect: autoConnect,
         is_active: isActive,
+        voice_enabled: voiceEnabled,
+        voice_id: voiceId.trim() || null,
+        call_summary_prompt: callSummaryPrompt.trim() || null,
       };
 
       let agentId = agent?.id;
@@ -234,6 +246,9 @@ export function AgentDialog({
               </TabsTrigger>
               <TabsTrigger value="settings" className="flex-1 sm:flex-none sm:px-6">
                 Settings
+              </TabsTrigger>
+              <TabsTrigger value="voice" className="flex-1 sm:flex-none sm:px-6">
+                Voice
               </TabsTrigger>
             </TabsList>
 
@@ -458,6 +473,48 @@ export function AgentDialog({
                   </SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="voice" className="mt-0 space-y-4">
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/10 p-4">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">Voice calls</p>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Answer inbound WhatsApp voice calls with this agent via LiveKit.
+                  Requires LiveKit settings and a deployed worker.
+                </p>
+              </div>
+              <Switch checked={voiceEnabled} onCheckedChange={setVoiceEnabled} />
+            </div>
+            <div className="grid gap-2 rounded-lg border border-border bg-muted/10 p-4">
+              <Label htmlFor="agent-voice-id">TTS voice ID</Label>
+              <Input
+                id="agent-voice-id"
+                value={voiceId}
+                onChange={(e) => setVoiceId(e.target.value)}
+                placeholder="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+                disabled={!voiceEnabled}
+              />
+              <p className="text-xs text-muted-foreground">
+                Cartesia voice ID for LiveKit Inference TTS (sonic-3). Leave blank
+                for the worker default.
+              </p>
+            </div>
+            <div className="grid gap-2 rounded-lg border border-border bg-muted/10 p-4">
+              <Label htmlFor="agent-call-summary">Call summary prompt</Label>
+              <Textarea
+                id="agent-call-summary"
+                value={callSummaryPrompt}
+                onChange={(e) => setCallSummaryPrompt(e.target.value)}
+                rows={4}
+                disabled={!voiceEnabled}
+                placeholder="Summarize this WhatsApp voice call in 2-4 sentences…"
+              />
+              <p className="text-xs text-muted-foreground">
+                Used after the call ends to generate an inbox summary via your
+                account LLM.
+              </p>
             </div>
           </TabsContent>
         </Tabs>

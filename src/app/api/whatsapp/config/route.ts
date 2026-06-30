@@ -7,6 +7,7 @@ import { prisma } from "@/lib/prisma";
 import { encrypt, decrypt } from "@/lib/whatsapp/encryption";
 import {
   registerPhoneNumber,
+  resolveWabaId,
   subscribeWabaToApp,
   verifyPhoneNumber,
 } from "@/lib/whatsapp/meta-api";
@@ -211,10 +212,24 @@ export async function POST(request: Request) {
     }
 
     let subscribedAppsAt: Date | null = null;
-    if (waba_id) {
+    let resolvedWabaId: string | null = waba_id?.trim() || null;
+    try {
+      resolvedWabaId = await resolveWabaId({
+        phoneNumberId: phone_number_id,
+        accessToken: access_token,
+        storedWabaId: resolvedWabaId,
+      });
+    } catch (err) {
+      console.warn(
+        "[whatsapp/config POST] WABA auto-resolve failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+
+    if (resolvedWabaId) {
       try {
         await subscribeWabaToApp({
-          wabaId: waba_id,
+          wabaId: resolvedWabaId,
           accessToken: access_token,
         });
         subscribedAppsAt = new Date();
@@ -226,7 +241,7 @@ export async function POST(request: Request) {
 
     const baseData = {
       phoneNumberId: phone_number_id,
-      wabaId: waba_id || null,
+      wabaId: resolvedWabaId,
       accessToken: encryptedAccessToken,
       verifyToken: encryptedVerifyToken,
       status: (registrationError ? "disconnected" : "connected") as WhatsappConfigStatus,

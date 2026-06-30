@@ -4,7 +4,7 @@ import { getCurrentAccount, toErrorResponse } from '@/lib/auth/account'
 import { serializeMessageTemplate } from '@/lib/db/api-serialize'
 import { prisma } from '@/lib/prisma'
 import { decrypt } from '@/lib/whatsapp/encryption'
-import { submitMessageTemplate } from '@/lib/whatsapp/meta-api'
+import { submitMessageTemplate, resolveWabaId } from '@/lib/whatsapp/meta-api'
 import {
   validateTemplatePayload,
   type TemplatePayload,
@@ -180,17 +180,43 @@ export async function POST(request: Request) {
           { status: 400 },
         )
       }
-      if (!config.wabaId) {
+      if (!config.phoneNumberId) {
         return NextResponse.json(
           {
             error:
-              'WABA (WhatsApp Business Account) ID missing. Re-connect your account in Settings.',
+              'Phone Number ID missing. Re-connect your WhatsApp account in Settings.',
           },
           { status: 400 },
         )
       }
 
       const accessToken = decrypt(config.accessToken)
+
+      let wabaId: string
+      try {
+        wabaId = await resolveWabaId({
+          phoneNumberId: config.phoneNumberId,
+          accessToken,
+          storedWabaId: config.wabaId,
+        })
+      } catch (e) {
+        return NextResponse.json(
+          {
+            error:
+              e instanceof Error
+                ? e.message
+                : 'Could not resolve WhatsApp Business Account ID.',
+          },
+          { status: 502 },
+        )
+      }
+
+      if (wabaId !== config.wabaId) {
+        await prisma.whatsappConfig.update({
+          where: { accountId },
+          data: { wabaId },
+        })
+      }
 
       // Image headers need a Resumable-Upload handle (Meta rejects a
       // plain URL at creation). Derive it from header_media_url before
@@ -208,7 +234,7 @@ export async function POST(request: Request) {
       const metaPayload = buildMetaTemplatePayload(payload)
       try {
         const meta = await submitMessageTemplate({
-          wabaId: config.wabaId,
+          wabaId,
           accessToken,
           payload: metaPayload,
         })

@@ -211,6 +211,153 @@ export async function getSubscribedApps(
   return data.data ?? []
 }
 
+export interface GetWabaIdFromPhoneNumberArgs {
+  phoneNumberId: string
+  accessToken: string
+}
+
+function getMetaAppAccessToken(): string | null {
+  const appId = process.env.META_APP_ID?.trim()
+  const appSecret = process.env.META_APP_SECRET?.trim()
+  if (!appId || !appSecret) return null
+  return `${appId}|${appSecret}`
+}
+
+/**
+ * Read WABA IDs granted to this access token via Meta's debug_token endpoint.
+ * Requires META_APP_ID + META_APP_SECRET (app access token).
+ */
+export async function getWabaIdsFromAccessToken(
+  accessToken: string,
+): Promise<string[]> {
+  const appToken = getMetaAppAccessToken()
+  if (!appToken) return []
+
+  const params = new URLSearchParams({ input_token: accessToken })
+  const response = await fetch(`${META_API_BASE}/debug_token?${params}`, {
+    headers: { Authorization: `Bearer ${appToken}` },
+  })
+  if (!response.ok) return []
+
+  const body = (await response.json()) as {
+    data?: {
+      granular_scopes?: Array<{ scope?: string; target_ids?: string[] }>
+    }
+  }
+
+  const ids = new Set<string>()
+  for (const gs of body.data?.granular_scopes ?? []) {
+    if (
+      gs.scope === 'whatsapp_business_management' ||
+      gs.scope === 'whatsapp_business_messaging'
+    ) {
+      for (const id of gs.target_ids ?? []) {
+        if (id) ids.add(String(id))
+      }
+    }
+  }
+  return [...ids]
+}
+
+async function wabaOwnsPhoneNumber(
+  wabaId: string,
+  phoneNumberId: string,
+  accessToken: string,
+): Promise<boolean> {
+  const url = `${META_API_BASE}/${wabaId}/phone_numbers?fields=id&limit=250`
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!response.ok) return false
+  const body = (await response.json()) as { data?: Array<{ id?: string }> }
+  return (body.data ?? []).some((row) => row.id === phoneNumberId)
+}
+
+function wabaResolutionHelpMessage(): string {
+  if (!getMetaAppAccessToken()) {
+    return (
+      'Could not resolve WhatsApp Business Account ID automatically. Add META_APP_ID and META_APP_SECRET to your environment, or paste your WhatsApp Business Account ID in Settings → WhatsApp (Meta Developer Console → WhatsApp → API Setup). It is not the same as the Phone Number ID.'
+    )
+  }
+  return (
+    'Could not resolve WhatsApp Business Account ID from your access token. Paste your WhatsApp Business Account ID in Settings → WhatsApp (Meta Developer Console → WhatsApp → API Setup). It is not the same as the Phone Number ID or Business Portfolio ID.'
+  )
+}
+
+/**
+ * Resolve the WhatsApp Business Account ID for a phone number.
+ *
+ * Cloud API phone number nodes do NOT expose `whatsapp_business_account`,
+ * so we discover WABA IDs from the token (debug_token) and match via
+ * `/{waba-id}/phone_numbers` + `message_templates` probes.
+ */
+export async function getWabaIdFromPhoneNumber(
+  args: GetWabaIdFromPhoneNumberArgs,
+): Promise<string> {
+  const { phoneNumberId, accessToken } = args
+  const candidates = await getWabaIdsFromAccessToken(accessToken)
+
+  const matched: string[] = []
+  for (const wabaId of candidates) {
+    if (!(await wabaIdSupportsTemplates(wabaId, accessToken))) continue
+    if (await wabaOwnsPhoneNumber(wabaId, phoneNumberId, accessToken)) {
+      matched.push(wabaId)
+    }
+  }
+  if (matched.length === 1) return matched[0]
+  if (matched.length > 1) {
+    throw new Error(
+      'Multiple WhatsApp Business Accounts match this phone number. Set the correct WABA ID manually in Settings → WhatsApp.',
+    )
+  }
+
+  // Some tokens can list templates but not phone_numbers — accept a single candidate.
+  const templateCapable: string[] = []
+  for (const wabaId of candidates) {
+    if (await wabaIdSupportsTemplates(wabaId, accessToken)) {
+      templateCapable.push(wabaId)
+    }
+  }
+  if (templateCapable.length === 1) return templateCapable[0]
+
+  throw new Error(wabaResolutionHelpMessage())
+}
+
+export interface ResolveWabaIdArgs {
+  phoneNumberId: string
+  accessToken: string
+  storedWabaId?: string | null
+}
+
+async function wabaIdSupportsTemplates(
+  wabaId: string,
+  accessToken: string,
+): Promise<boolean> {
+  const url = `${META_API_BASE}/${wabaId}/message_templates?limit=1`
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  return response.ok
+}
+
+/**
+ * Return the WABA ID to use for template APIs.
+ *
+ * When the user saved a WABA ID in Settings, trust it — template sync will
+ * surface Meta's real error if the ID or token is wrong. Auto-discovery only
+ * runs when WABA is missing or clearly wrong (same value as Phone Number ID).
+ */
+export async function resolveWabaId(args: ResolveWabaIdArgs): Promise<string> {
+  const { phoneNumberId, accessToken, storedWabaId } = args
+  const trimmed = storedWabaId?.trim()
+
+  if (trimmed && trimmed !== phoneNumberId) {
+    return trimmed
+  }
+
+  return getWabaIdFromPhoneNumber({ phoneNumberId, accessToken })
+}
+
 // ============================================================
 // Sending
 // ============================================================
@@ -525,6 +672,81 @@ export async function uploadResumableMedia(
 // ============================================================
 
 import type { MetaTemplateSubmitPayload } from './template-components'
+
+export interface MetaTemplateListItem {
+  id: string
+  name: string
+  language: string
+  status: string
+  category: string
+  components?: Array<{
+    type: string
+    text?: string
+    format?: string
+    buttons?: Array<{
+      type: string
+      text: string
+      url?: string
+      phone_number?: string
+      example?: string[] | string
+    }>
+    example?: {
+      header_text?: string[]
+      header_handle?: string[]
+      body_text?: string[][]
+    }
+  }>
+  quality_score?: { score?: string } | string
+}
+
+export interface ListMessageTemplatesArgs {
+  wabaId: string
+  accessToken: string
+  limit?: number
+  pageCap?: number
+}
+
+export interface ListMessageTemplatesResult {
+  templates: MetaTemplateListItem[]
+  truncated: boolean
+}
+
+/**
+ * List message templates from Meta for a WABA. Paginates until done or
+ * `pageCap` is reached.
+ */
+export async function listMessageTemplates(
+  args: ListMessageTemplatesArgs,
+): Promise<ListMessageTemplatesResult> {
+  const { wabaId, accessToken, limit = 100, pageCap = 20 } = args
+  const fields =
+    'id,name,language,status,category,components,quality_score'
+  const templates: MetaTemplateListItem[] = []
+  let nextUrl: string | null =
+    `${META_API_BASE}/${wabaId}/message_templates?limit=${limit}&fields=${fields}`
+  let pageCount = 0
+
+  while (nextUrl && pageCount < pageCap) {
+    pageCount++
+    const response = await fetch(nextUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (!response.ok) {
+      await throwMetaError(response, `Meta API error: ${response.status}`)
+    }
+    const body = (await response.json()) as {
+      data?: MetaTemplateListItem[]
+      paging?: { next?: string }
+    }
+    if (body.data) templates.push(...body.data)
+    nextUrl = body.paging?.next ?? null
+  }
+
+  return {
+    templates,
+    truncated: pageCount >= pageCap && nextUrl !== null,
+  }
+}
 
 export interface SubmitMessageTemplateArgs {
   wabaId: string

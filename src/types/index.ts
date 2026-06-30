@@ -579,9 +579,23 @@ export interface AiAgent {
   reply_mode: AgentReplyMode;
   auto_connect: boolean;
   is_active: boolean;
+  voice_enabled: boolean;
+  voice_id?: string;
+  call_summary_prompt?: string;
   created_at: string;
   updated_at: string;
   tools?: AiAgentTool[];
+}
+
+export type LivekitSetupStatus = 'pending' | 'ready' | 'error';
+
+export interface AccountLivekitConfig {
+  livekit_url: string;
+  agent_name: string;
+  has_api_key: boolean;
+  has_api_secret: boolean;
+  setup_status: LivekitSetupStatus;
+  setup_error?: string;
 }
 
 export interface AccountLlmConfig {

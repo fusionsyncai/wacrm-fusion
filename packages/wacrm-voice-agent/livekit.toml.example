@@ -1,0 +1,5 @@
+# Reference only — do not copy empty subdomain/id into livekit.toml.
+# Run `lk agent create` to generate livekit.toml for your LiveKit Cloud project.
+
+[build]
+dockerfile = "Dockerfile"

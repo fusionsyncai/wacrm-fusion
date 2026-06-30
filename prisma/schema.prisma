@@ -206,6 +206,19 @@ enum ConversationHandlingMode {
   HUMAN
 }
 
+enum VoiceSessionStatus {
+  ringing
+  active
+  completed
+  failed
+}
+
+enum LivekitSetupStatus {
+  pending
+  ready
+  error
+}
+
 // ---------------------------------------------------------------------------
 // NextAuth (Auth.js) — credentials identity
 // ---------------------------------------------------------------------------
@@ -300,7 +313,9 @@ model Account {
   memberPresences              MemberPresence[]
   apiKeys                      ApiKey[]
   llmConfigs                   AccountLlmConfig[]
+  livekitConfig                AccountLivekitConfig?
   aiAgents                     AiAgent[]
+  voiceSessions                VoiceSession[]
 
   @@unique([ownerUserId], map: "idx_accounts_one_per_owner")
   @@map("accounts")
@@ -399,21 +414,69 @@ model AccountLlmConfig {
   @@map("account_llm_configs")
 }
 
+model AccountLivekitConfig {
+  id           String             @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId    String             @unique @map("account_id") @db.Uuid
+  livekitUrl   String             @map("livekit_url")
+  apiKey       String             @map("api_key")
+  apiSecret    String             @map("api_secret")
+  agentName    String             @default("wacrm-voice") @map("agent_name")
+  setupStatus  LivekitSetupStatus @default(pending) @map("setup_status")
+  setupError   String?            @map("setup_error")
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("account_livekit_configs")
+}
+
+model VoiceSession {
+  id              String             @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId       String             @map("account_id") @db.Uuid
+  conversationId  String?            @map("conversation_id") @db.Uuid
+  aiAgentId       String?            @map("ai_agent_id") @db.Uuid
+  contactId       String?            @map("contact_id") @db.Uuid
+  whatsappCallId  String             @unique @map("whatsapp_call_id")
+  livekitRoomName String?            @map("livekit_room_name")
+  status          VoiceSessionStatus @default(ringing)
+  transcript      String?
+  summary         String?
+  failureReason   String?            @map("failure_reason")
+  startedAt       DateTime?          @map("started_at") @db.Timestamptz(6)
+  endedAt         DateTime?          @map("ended_at") @db.Timestamptz(6)
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  aiAgent      AiAgent?      @relation(fields: [aiAgentId], references: [id], onDelete: SetNull)
+  contact      Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([accountId, status], map: "idx_voice_sessions_account_status")
+  @@index([conversationId], map: "idx_voice_sessions_conversation")
+  @@map("voice_sessions")
+}
+
 model AiAgent {
-  id           String         @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  accountId    String         @map("account_id") @db.Uuid
-  name         String
-  description  String?
-  systemPrompt String         @map("system_prompt")
-  replyMode    AgentReplyMode @default(HUMAN) @map("reply_mode")
-  autoConnect  Boolean        @default(false) @map("auto_connect")
-  isActive     Boolean        @default(false) @map("is_active")
-  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  id                String         @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  accountId         String         @map("account_id") @db.Uuid
+  name              String
+  description       String?
+  systemPrompt      String         @map("system_prompt")
+  replyMode         AgentReplyMode @default(HUMAN) @map("reply_mode")
+  autoConnect       Boolean        @default(false) @map("auto_connect")
+  isActive          Boolean        @default(false) @map("is_active")
+  voiceEnabled      Boolean        @default(false) @map("voice_enabled")
+  voiceId           String?        @map("voice_id")
+  callSummaryPrompt String?        @map("call_summary_prompt")
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   account       Account        @relation(fields: [accountId], references: [id], onDelete: Cascade)
   tools         AiAgentTool[]
   conversations Conversation[]
+  voiceSessions VoiceSession[]
 
   @@index([accountId], map: "idx_ai_agents_account")
   @@map("ai_agents")
@@ -463,6 +526,7 @@ model Contact {
   automationLogs               AutomationLog[]
   automationPendingExecutions  AutomationPendingExecution[]
   flowRuns                     FlowRun[]
+  voiceSessions                VoiceSession[]
 
   @@index([userId], map: "idx_contacts_user_id")
   @@index([phone], map: "idx_contacts_phone")
@@ -572,6 +636,7 @@ model Conversation {
   messageReactions MessageReaction[]
   deals            Deal[]
   flowRuns         FlowRun[]
+  voiceSessions    VoiceSession[]
 
   @@index([userId], map: "idx_conversations_user_id")
   @@index([contactId], map: "idx_conversations_contact_id")

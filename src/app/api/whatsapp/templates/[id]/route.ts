@@ -7,6 +7,7 @@ import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   deleteMessageTemplate,
   editMessageTemplate,
+  resolveWabaId,
 } from '@/lib/whatsapp/meta-api'
 import {
   validateTemplatePayload,
@@ -236,16 +237,40 @@ export async function DELETE(
       const config = await prisma.whatsappConfig.findUnique({
         where: { accountId },
       })
-      if (!config?.wabaId) {
+      if (!config?.phoneNumberId) {
         return NextResponse.json(
           { error: 'WhatsApp not configured — cannot delete on Meta.' },
           { status: 400 },
         )
       }
       const accessToken = decrypt(config.accessToken)
+      let wabaId: string
+      try {
+        wabaId = await resolveWabaId({
+          phoneNumberId: config.phoneNumberId,
+          accessToken,
+          storedWabaId: config.wabaId,
+        })
+      } catch (e) {
+        return NextResponse.json(
+          {
+            error:
+              e instanceof Error
+                ? e.message
+                : 'Could not resolve WhatsApp Business Account ID.',
+          },
+          { status: 502 },
+        )
+      }
+      if (wabaId !== config.wabaId) {
+        await prisma.whatsappConfig.update({
+          where: { accountId },
+          data: { wabaId },
+        })
+      }
       try {
         await deleteMessageTemplate({
-          wabaId: config.wabaId,
+          wabaId,
           accessToken,
           name: existing.name,
           metaTemplateId: existing.metaTemplateId,

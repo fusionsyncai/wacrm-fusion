@@ -31,10 +31,12 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
 # keep example files so forkers have a template to copy
 !.env.local.example
 !.env.example
+# worker deploy artifacts (generated per LiveKit project)
+packages/wacrm-voice-agent/livekit.toml
+packages/wacrm-voice-agent/.dockerignore
 
 # vercel
 .vercel
@@ -45,3 +47,4 @@ next-env.d.ts
 
 # prisma
 /generated
+config.bat

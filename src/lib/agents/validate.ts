@@ -73,6 +73,9 @@ export function validateAgentInput(body: {
   reply_mode?: unknown;
   auto_connect?: unknown;
   is_active?: unknown;
+  voice_enabled?: unknown;
+  voice_id?: unknown;
+  call_summary_prompt?: unknown;
 }): { ok: true; data: {
   name: string;
   description: string | null;
@@ -80,6 +83,9 @@ export function validateAgentInput(body: {
   replyMode: AgentReplyMode;
   autoConnect: boolean;
   isActive: boolean;
+  voiceEnabled: boolean;
+  voiceId: string | null;
+  callSummaryPrompt: string | null;
 } } | { ok: false; error: string } {
   if (typeof body.name !== "string" || !body.name.trim()) {
     return { ok: false, error: "name is required" };
@@ -103,6 +109,16 @@ export function validateAgentInput(body: {
       replyMode,
       autoConnect: body.auto_connect === true,
       isActive: body.is_active === true,
+      voiceEnabled: body.voice_enabled === true,
+      voiceId:
+        typeof body.voice_id === "string" && body.voice_id.trim()
+          ? body.voice_id.trim()
+          : null,
+      callSummaryPrompt:
+        typeof body.call_summary_prompt === "string" &&
+        body.call_summary_prompt.trim()
+          ? body.call_summary_prompt.trim()
+          : null,
     },
   };
 }

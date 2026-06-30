@@ -550,6 +550,9 @@ export function WhatsAppConfig() {
                 onChange={(e) => setWabaId(e.target.value)}
                 className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
               />
+              <p className="text-xs text-muted-foreground">
+                From Meta Developer Console → WhatsApp → API Setup. Not the same as Phone Number ID — leave blank to auto-detect on save if META_APP_ID/SECRET are set.
+              </p>
             </div>
 
             <div className="space-y-2">
